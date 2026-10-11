@@ -6,6 +6,7 @@ Human Review: All AI-assisted code, logic, and reverse-engineering outputs have 
 No Copyrighted AI Inputs: AI tools used in this project were not supplied with proprietary or illegal code dumps during generation.
 
 Contributions: Contributors are permitted to use AI assistance for code generation, bug fixing, or documentation, provided all submitted code is verified, functional, and compliant with standard project guidelines.
+
 🌟 Key Features
 Native PC Performance: Runs directly on x86-64 hardware without the overhead of traditional emulation.
 
