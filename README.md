@@ -1,3 +1,11 @@
+🤖 AI Usage Disclaimer
+This codebase and repository contain contributions generated, assisted, or refactored with the assistance of Artificial Intelligence (AI) tools (e.g., LLMs / automated code generation tools).
+
+Human Review: All AI-assisted code, logic, and reverse-engineering outputs have been manually reviewed, tested, and vetted by human developers prior to integration.
+
+No Copyrighted AI Inputs: AI tools used in this project were not supplied with proprietary or illegal code dumps during generation.
+
+Contributions: Contributors are permitted to use AI assistance for code generation, bug fixing, or documentation, provided all submitted code is verified, functional, and compliant with standard project guidelines.
 🌟 Key Features
 Native PC Performance: Runs directly on x86-64 hardware without the overhead of traditional emulation.
 
