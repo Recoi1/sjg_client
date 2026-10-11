@@ -10,3 +10,15 @@ Enhanced Visuals: Support for high-resolution texture packs, wide-aspect ratios 
 Low Latency Input: Minimal input lag compared to standard Wii emulation.
 
 Quick Loading: Lightning-fast loading times thanks to native file system access.
+
+📜 License & Disclaimers
+
+### Usage & Modding
+This client is an open-source community effort. You are free to fork, modify, add mods/scripts (via Lua or C), and submit contributions or pull requests to this repository.
+
+### Non-Commercial Notice
+* **No Sale / No Monetization:** This project is non-commercial. You may **not** sell, monetize, or bundle this client or any derivative works for financial gain.
+* **No Assets Included:** This repository contains **no copyrighted game assets** (textures, audio, models, or copyrighted game code). Users must supply their own legally obtained game dump to extract assets and compile the client.
+
+### Trademarks
+*All product and company names are trademarks™ or registered® trademarks of their respective holders. Use of them does not imply any affiliation with or endorsement by them.*
