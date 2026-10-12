@@ -1,0 +1,3062 @@
+diff --git a/cmake/AuroraNodProvider.cmake b/cmake/AuroraNodProvider.cmake
+index 3bcbbdf..74e2ea0 100644
+--- a/cmake/AuroraNodProvider.cmake
++++ b/cmake/AuroraNodProvider.cmake
+@@ -140,6 +140,16 @@ elseif (_aurora_nod_provider STREQUAL "package")
+   )
+   FetchContent_MakeAvailable(nod_prebuilt)
+ 
++  # The Windows package uses MSVC filenames for its C ABI, including on MinGW.
++  if (WIN32 AND NOT MSVC)
++    add_library(nod::nod SHARED IMPORTED GLOBAL)
++    set_target_properties(nod::nod PROPERTIES
++      IMPORTED_LOCATION "${nod_prebuilt_SOURCE_DIR}/bin/nod.dll"
++      IMPORTED_IMPLIB "${nod_prebuilt_SOURCE_DIR}/lib/nod.lib"
++      INTERFACE_INCLUDE_DIRECTORIES "${nod_prebuilt_SOURCE_DIR}/include")
++    return()
++  endif ()
++
+   # The prebuilt package ships a CMake config that creates nod::nod_shared,
+   # nod::nod_static, and a default nod::nod (based on BUILD_SHARED_LIBS).
+   # Set BUILD_SHARED_LIBS so the config selects the right default target.
+diff --git a/cmake/aurora_core.cmake b/cmake/aurora_core.cmake
+index bb88ba9..4811b84 100644
+--- a/cmake/aurora_core.cmake
++++ b/cmake/aurora_core.cmake
+@@ -43,7 +43,10 @@ endif ()
+ 
+ if (CMAKE_SYSTEM_NAME STREQUAL Windows)
+     # stuff for fetching system info.
+-    target_link_libraries(aurora_core PRIVATE wbemuuid.lib comsuppw.lib ntdll.lib DXGI.lib)
++    target_link_libraries(aurora_core PRIVATE wbemuuid.lib ntdll.lib DXGI.lib)
++    if (MSVC)
++        target_link_libraries(aurora_core PRIVATE comsuppw.lib)
++    endif ()
+ elseif (APPLE)
+     target_sources(aurora_core PRIVATE lib/system_info_mac.mm)
+ endif ()
+diff --git a/examples/CMakeLists.txt b/examples/CMakeLists.txt
+index c5977f6..d8d2676 100644
+--- a/examples/CMakeLists.txt
++++ b/examples/CMakeLists.txt
+@@ -1,4 +1,6 @@
+ if (AURORA_ENABLE_GX)
+   add_executable(simple simple.c)
+   target_link_libraries(simple PRIVATE aurora::core aurora::gx aurora::main aurora::vi)
++  include(${CMAKE_CURRENT_LIST_DIR}/../cmake/AuroraCopyRuntimeDLLs.cmake)
++  aurora_copy_runtime_dlls(simple)
+ endif ()
+diff --git a/examples/simple.c b/examples/simple.c
+index cb8a6c4..79a7c33 100644
+--- a/examples/simple.c
++++ b/examples/simple.c
+@@ -3,6 +3,7 @@
+ #include <aurora/main.h>
+ #include <dolphin/gx.h>
+ #include <dolphin/os.h>
++#include <SDL3/SDL.h>
+ 
+ #include <stdio.h>
+ #include <string.h>
+@@ -31,6 +32,7 @@ static void log_callback(AuroraLogLevel level, const char* module, const char* m
+     break;
+   }
+   fprintf(out, "[%s: %s;%s]\n", levelStr, module, message);
++  fflush(out);
+   if (level == LOG_FATAL) {
+     fflush(out);
+     abort();
+@@ -49,15 +51,26 @@ static void draw() {
+ }
+ 
+ int main(int argc, char* argv[]) {
++  const bool smokeTest = argc > 1 && strcmp(argv[1], "--smoke-test") == 0;
+   const AuroraConfig config = {
+-      .appName = "Demo",
++      .appName = smokeTest ? "Aurora platform check" : "Demo",
++      .userPath = smokeTest ? "./" : NULL,
++      .cachePath = smokeTest ? "./" : NULL,
+       .logCallback = &log_callback,
+   };
+   AuroraInfo initInfo = aurora_initialize(argc, argv, &config);
++  if (smokeTest) {
++    SDL_SetWindowOpacity(initInfo.window, 0.0f);
++  }
++  const Uint64 deadline = SDL_GetTicks() + 10000;
++  unsigned frames = 0;
+ 
+   bool exiting = false;
+   bool paused = false;
+   while (!exiting) {
++    if (smokeTest && SDL_GetTicks() >= deadline) {
++      break;
++    }
+     const AuroraEvent* event = aurora_update();
+     while (event != NULL && event->type != AURORA_NONE) {
+       switch (event->type) {
+@@ -83,8 +96,16 @@ int main(int argc, char* argv[]) {
+     }
+     draw();
+     aurora_end_frame();
++    ++frames;
++    if (smokeTest && frames == 60) {
++      break;
++    }
+   }
+ 
+   aurora_shutdown();
++  if (smokeTest) {
++    printf("Platform smoke check: %u frames; backend=%d\n", frames, initInfo.backend);
++    return frames == 60 && initInfo.backend != BACKEND_NULL ? 0 : 1;
++  }
+   return 0;
+ }
+diff --git a/include/aurora/aurora.h b/include/aurora/aurora.h
+index 92b734f..7495892 100644
+--- a/include/aurora/aurora.h
++++ b/include/aurora/aurora.h
+@@ -143,6 +143,8 @@ SDL_Window* aurora_get_window();
+ AuroraWindowSize aurora_get_window_size();
+ 
+ AuroraBackend aurora_get_backend();
++/** Recreates GPU resources between frames, preserving the window, input and game memory. */
++bool aurora_reconfigure_graphics(AuroraBackend backend, unsigned msaa);
+ const AuroraBackend* aurora_get_available_backends(size_t* count);
+ float aurora_get_timescale();
+ 
+diff --git a/include/aurora/texture.hpp b/include/aurora/texture.hpp
+index 6c68778..039d1f9 100644
+--- a/include/aurora/texture.hpp
++++ b/include/aurora/texture.hpp
+@@ -43,6 +43,10 @@ struct RawTextureReplacement {
+   std::string_view label = {};
+ };
+ 
++// Copies native model pixels; GPU preparation runs on the render thread. Palette textures keep their normal resolver.
++bool queue_texture_preload(RawTextureReplacement source);
++bool texture_preloads_pending();
++
+ struct ReplacementOptions {
+   int32_t priority = 0;
+ };
+diff --git a/include/dolphin/ar.h b/include/dolphin/ar.h
+index c60c9c0..89bc6aa 100644
+--- a/include/dolphin/ar.h
++++ b/include/dolphin/ar.h
+@@ -20,7 +20,7 @@ typedef void (*ARCallback)(void);
+ 
+ ARCallback ARRegisterDMACallback(ARCallback callback);
+ u32 ARGetDMAStatus(void);
+-void ARStartDMA(u32 type, u32 mainmem_addr, u32 aram_addr, u32 length);
++void ARStartDMA(u32 type, uintptr_t mainmem_addr, u32 aram_addr, u32 length);
+ u32 ARAlloc(u32 length);
+ u32 ARFree(u32* length);
+ BOOL ARCheckInit(void);
+diff --git a/include/dolphin/dvd.h b/include/dolphin/dvd.h
+index 026a35a..0ada36c 100644
+--- a/include/dolphin/dvd.h
++++ b/include/dolphin/dvd.h
+@@ -175,6 +175,7 @@ int DVDCancelAllAsync(DVDCBCallback callback);
+ s32 DVDCancelAll(void);
+ DVDDiskID* DVDGetCurrentDiskID(void);
+ BOOL DVDCheckDisk(void);
++BOOL DVDCheckDiskAsync(DVDCommandBlock*, DVDCBCallback);
+ 
+ // DVD FATAL
+ int DVDSetAutoFatalMessaging(BOOL enable);
+diff --git a/include/dolphin/gx/GXAurora.h b/include/dolphin/gx/GXAurora.h
+index 1a312fb..97cd839 100644
+--- a/include/dolphin/gx/GXAurora.h
++++ b/include/dolphin/gx/GXAurora.h
+@@ -8,6 +8,11 @@ extern "C" {
+ #endif
+ 
+ //
++// Stable 24-bit handles keep native addresses in fixed-size GD texture commands.
++// The caller owns the bytes and must keep them alive until FIFO processing finishes.
++u32 AuroraRegisterTexturePointer(const void* data);
++const void* AuroraResolveTexturePointer(u32 handle);
++
+ // Subcommands for GX_AURORA.
+ //
+ 
+@@ -129,6 +134,8 @@ typedef enum _AuroraViewportPolicy {
+  * Configures content framebuffer sizing and how GXSetViewport/GXSetScissor parameters are applied to rendering.
+  * When AURORA_VIEWPORT_NATIVE is used, GXSetTexCopySrc/GXSetTexCopyDst will use native framebuffer resolution.
+  */
++void AuroraSetContentAspect(float aspect);
++void AuroraSetTextureFiltering(unsigned mode);
+ void AuroraSetViewportPolicy(AuroraViewportPolicy policy);
+ 
+ /**
+diff --git a/include/dolphin/gx/GXExtra.h b/include/dolphin/gx/GXExtra.h
+index 27713aa..4633f11 100644
+--- a/include/dolphin/gx/GXExtra.h
++++ b/include/dolphin/gx/GXExtra.h
+@@ -16,6 +16,8 @@ typedef struct {
+   float a;
+ } GXColorF32;
+ 
++// Reuse a zero-initialized object for video frames; update at most once per rendered frame.
++void GXInitTexObjStreaming(GXTexObj* obj, const void* data, u16 width, u16 height, GXTexFmt format);
+ void GXDestroyTexObj(GXTexObj* obj);
+ void GXDestroyTlutObj(GXTlutObj* obj);
+ void GXDestroyCopyTex(void* dest);
+diff --git a/include/dolphin/gx/GXManage.h b/include/dolphin/gx/GXManage.h
+index a4d7d72..7a2568e 100644
+--- a/include/dolphin/gx/GXManage.h
++++ b/include/dolphin/gx/GXManage.h
+@@ -14,6 +14,8 @@ GXFifoObj* GXInit(void* base, u32 size);
+ GXDrawSyncCallback GXSetDrawSyncCallback(GXDrawSyncCallback cb);
+ GXDrawDoneCallback GXSetDrawDoneCallback(GXDrawDoneCallback cb);
+ void GXDrawDone(void);
++void GXSetDrawSync(u16 token);
++u16 GXReadDrawSync(void);
+ void GXSetDrawDone(void);
+ void GXFlush(void);
+ void GXPixModeSync(void);
+diff --git a/include/dolphin/gx/GXStruct.h b/include/dolphin/gx/GXStruct.h
+index 3a4e3ec..bda43b8 100644
+--- a/include/dolphin/gx/GXStruct.h
++++ b/include/dolphin/gx/GXStruct.h
+@@ -63,7 +63,7 @@ typedef struct {
+ 
+ typedef struct {
+ #ifdef TARGET_PC
+-  u32 dummy[16];
++  union { u32 dummy[16]; u64 nativeAlignment; };
+ #else
+   u32 dummy[8];
+ #endif
+@@ -71,7 +71,7 @@ typedef struct {
+ 
+ typedef struct {
+ #ifdef TARGET_PC
+-  u32 dummy[10];
++  union { u32 dummy[10]; u64 nativeAlignment; };
+ #else
+   u32 dummy[3];
+ #endif
+diff --git a/include/dolphin/gx/GXTransform.h b/include/dolphin/gx/GXTransform.h
+index d0de2b9..7b3cb0b 100644
+--- a/include/dolphin/gx/GXTransform.h
++++ b/include/dolphin/gx/GXTransform.h
+@@ -28,6 +28,7 @@ void GXSetViewport(f32 left, f32 top, f32 wd, f32 ht, f32 nearz, f32 farz);
+ void GXSetCurrentMtx(u32 id);
+ void GXSetViewportJitter(f32 left, f32 top, f32 wd, f32 ht, f32 nearz, f32 farz, u32 field);
+ void GXSetScissorBoxOffset(s32 x_off, s32 y_off);
++void GXSetZScaleOffset(f32 scale, f32 offset);
+ void GXSetClipMode(GXClipMode mode);
+ 
+ #ifdef __cplusplus
+diff --git a/include/dolphin/gx/GXVert.h b/include/dolphin/gx/GXVert.h
+index 2770b44..63d30e9 100644
+--- a/include/dolphin/gx/GXVert.h
++++ b/include/dolphin/gx/GXVert.h
+@@ -126,6 +126,7 @@ static inline void GXEnd(void) {}
+ #endif
+ 
+ void GXCmd1u8(const u8 x);
++void GXCmd1f32(const f32 x);
+ void GXCmd1u16(const u16 x);
+ void GXCmd1u32(const u32 x);
+ void GXCmd1u64(const u64 x);
+diff --git a/include/dolphin/os/OSAlarm.h b/include/dolphin/os/OSAlarm.h
+index 3105039..c495be3 100644
+--- a/include/dolphin/os/OSAlarm.h
++++ b/include/dolphin/os/OSAlarm.h
+@@ -17,6 +17,7 @@ struct OSAlarm {
+     OSAlarm* next;
+     OSTime period;
+     OSTime start;
++    void* userData;
+ };
+ 
+ BOOL OSCheckAlarmQueue(void);
+diff --git a/include/dolphin/thp.h b/include/dolphin/thp.h
+index 1041b4c..399a229 100644
+--- a/include/dolphin/thp.h
++++ b/include/dolphin/thp.h
+@@ -2,12 +2,16 @@
+ #define _DOLPHIN_THP_H_
+ 
+ #include <dolphin/types.h>
++#include <stddef.h>
+ 
+ #ifdef __cplusplus
+ extern "C" {
+ #endif
+ 
+ BOOL THPInit(void);
++s32 THPVideoDecodeSized(const void* file, size_t fileSize, void* tileY, size_t ySize,
++                        void* tileU, size_t uSize, void* tileV, size_t vSize, u32 width, u32 height);
++u32 THPAudioDecodeSized(s16* output, size_t sampleCapacity, const u8* frame, size_t frameSize, s32 flag);
+ s32 THPVideoDecode(const void* file, void* tileY, void* tileU, void* tileV, void* work /* unused */);
+ u32 THPAudioDecode(s16* audioBuffer, const u8* audioFrame, s32 flag);
+ 
+diff --git a/include/dolphin/vi.h b/include/dolphin/vi.h
+index 377d952..6388a44 100644
+--- a/include/dolphin/vi.h
++++ b/include/dolphin/vi.h
+@@ -15,6 +15,7 @@ void VIConfigurePan(u16 xOrg, u16 yOrg, u16 width, u16 height);
+ void VIFlush(void);
+ 
+ void VIWaitForRetrace(void);
++void VIAdvanceRetrace(void);
+ 
+ u32 VIGetTvFormat(void);
+ u32 VIGetRetraceCount(void);
+diff --git a/lib/aurora.cpp b/lib/aurora.cpp
+index 122262c..0122862 100644
+--- a/lib/aurora.cpp
++++ b/lib/aurora.cpp
+@@ -256,6 +256,7 @@ bool begin_frame() noexcept {
+   if (!gfx::begin_frame()) {
+     return false;
+   }
++  gx::texture::preload_frame();
+   gx::fifo::begin_frame();
+ #endif
+   return true;
+@@ -459,6 +460,41 @@ AuroraWindowSize aurora_get_window_size() {
+   return aurora::window::get_sdl_window() != nullptr ? aurora::window::get_window_size() : AuroraWindowSize{};
+ }
+ AuroraBackend aurora_get_backend() { return aurora::g_config.desiredBackend; }
++bool aurora_reconfigure_graphics(AuroraBackend backend, unsigned msaa) {
++#ifdef AURORA_ENABLE_GX
++  using namespace aurora;
++  if (msaa != 1 && msaa != 4) return false;
++  if (backend == BACKEND_AUTO) backend = PreferredBackendOrder.front();
++  if (std::find(PreferredBackendOrder.begin(), PreferredBackendOrder.end(), backend) == PreferredBackendOrder.end()) return false;
++  const auto previousBackend = g_config.desiredBackend;
++  const auto previousMsaa = g_config.msaa;
++  if (backend == previousBackend && msaa == previousMsaa) return true;
++  gfx::gpu_synchronize();
++  if (backend == previousBackend) {
++    g_config.msaa = msaa;
++    const auto size = window::get_window_size();
++    webgpu::resize_swapchain(size.fb_width, size.fb_height, size.native_fb_width, size.native_fb_height, true);
++    return true;
++  }
++  imgui::shutdown();
++  gfx::shutdown(true);
++  webgpu::shutdown();
++  g_config.msaa = msaa;
++  bool success = webgpu::initialize(backend, g_config.allowCpuAdapter);
++  if (!success) {
++    webgpu::shutdown();
++    g_config.msaa = previousMsaa;
++    AURORA_ASSERT(webgpu::initialize(previousBackend, g_config.allowCpuAdapter), "Cannot restore graphics backend");
++    backend = previousBackend;
++  }
++  g_config.desiredBackend = backend;
++  gfx::initialize();
++  imgui::create_context(); imgui::initialize();
++  return success;
++#else
++  return false;
++#endif
++}
+ const AuroraBackend* aurora_get_available_backends(size_t* count) {
+   if (count != nullptr) {
+     *count = aurora::PreferredBackendOrder.size();
+diff --git a/lib/dolphin/AR.cpp b/lib/dolphin/AR.cpp
+index ab9306b..7215f24 100644
+--- a/lib/dolphin/AR.cpp
++++ b/lib/dolphin/AR.cpp
+@@ -1,117 +1,106 @@
+ #include <dolphin/arq.h>
+ #include "../internal.hpp"
+-#include "dolphin/os.h"
+-
+-static aurora::Module Log("aurora::ar");
+-
+-static u32 AR_StackPointer;
+-static u32* AR_BlockLength;
+-static u32 AR_FreeBlocks;
+-static BOOL AR_init_flag;
+-
+-#define ARAM_STACK_START 0x4000
+-
+-// ARAM emulation: allocate a large buffer to simulate the GameCube's Auxiliary RAM.
+-// ARAM "addresses" are offsets into this buffer. On GameCube, ARAM is 16 MB starting
+-// at a base address returned by ARInit. We emulate this by malloc'ing a buffer
+-// and using a simple bump allocator (matching ARAlloc behavior on real hardware).
+-static u8* sAramBuffer = nullptr;
+-
+-// Convert an ARAM "address" (offset) to a real host pointer
+-static u8* aramToHost(u32 aramAddr) {
+-  if (!sAramBuffer || aramAddr >= aurora::g_config.mem2Size) {
+-    return nullptr;
+-  }
+-  return sAramBuffer + aramAddr;
++#include <cstdlib>
++#include <cstring>
++#include <mutex>
++#include <stdexcept>
++
++namespace {
++constexpr u32 base = 0x4000;
++std::mutex mutex;
++u8* storage = nullptr;
++u32 capacity = 0, top = base, blocks = 0, used = 0;
++u32* lengths = nullptr;
++ARCallback dmaCallback = nullptr;
++bool queueInitialized = false;
++u32 chunkSize = ARQ_CHUNK_SIZE_DEFAULT;
++void transfer(u32 type, uintptr_t source, uintptr_t dest, u32 length) {
++  if (type != ARAM_DIR_MRAM_TO_ARAM && type != ARAM_DIR_ARAM_TO_MRAM)
++    throw std::invalid_argument("invalid ARAM transfer direction");
++  const uintptr_t offset = type == ARAM_DIR_MRAM_TO_ARAM ? dest : source;
++  const uintptr_t host = type == ARAM_DIR_MRAM_TO_ARAM ? source : dest;
++  if (!storage || offset > capacity || length > capacity - offset || (length && !host))
++    throw std::out_of_range("ARAM transfer exceeds the native memory bank");
++  if (!length) return;
++  if (type == ARAM_DIR_MRAM_TO_ARAM) std::memmove(storage + offset, reinterpret_cast<const void*>(host), length);
++  else std::memmove(reinterpret_cast<void*>(host), storage + offset, length);
++}
++}
++u32 ARInit(u32* index, u32 entries) {
++  std::lock_guard lock(mutex);
++  if (storage) return base;
++  if (!index || !entries || aurora::g_config.mem2Size <= base) return 0;
++  storage = static_cast<u8*>(std::calloc(1, aurora::g_config.mem2Size));
++  if (!storage) return 0;
++  capacity = aurora::g_config.mem2Size;
++  lengths = index; blocks = entries; used = 0; top = base;
++  return base;
+ }
+-
+ u32 ARAlloc(u32 length) {
+-  u32 tmp;
+-
+-  ASSERTMSGLINE(430, !(length & 0x1F), "ARAlloc(): length is not multiple of 32bytes!");
+-  ASSERTMSGLINE(434, length <= (__AR_Size - __AR_StackPointer), "ARAlloc(): Out of ARAM!");
+-  ASSERTMSGLINE(435, __AR_FreeBlocks, "ARAlloc(): No more free blocks!");
+-
+-  tmp = AR_StackPointer;
+-  AR_StackPointer += length;
+-  *AR_BlockLength = length;
+-  AR_BlockLength += 1;
+-  AR_FreeBlocks -= 1;
+-  return tmp;
++  std::lock_guard lock(mutex);
++  if (!storage || !length || (length & 31) || used == blocks || length > capacity - top) return 0;
++  const u32 address = top;
++  lengths[used++] = length; top += length;
++  return address;
+ }
+-
+ u32 ARFree(u32* length) {
+-  AR_BlockLength -= 1;
+-  if (length) {
+-    *length = *AR_BlockLength;
+-  }
+-  AR_StackPointer -= *AR_BlockLength;
+-  AR_FreeBlocks += 1;
+-  return AR_StackPointer;
++  std::lock_guard lock(mutex);
++  if (!used) { if (length) *length = 0; return 0; }
++  const u32 size = lengths[--used]; top -= size;
++  if (length) *length = size;
++  return top;
+ }
+-
+-BOOL ARCheckInit(void) { return AR_init_flag; }
+-
+-u32 ARInit(u32* stack_index_addr, u32 num_entries) {
+-  if (aurora::g_config.mem2Size == 0) {
+-    Log.warn("ARInit called but no mem2Size specified in AuroraConfig. ARAM will not be available!");
+-    return 0;
+-  }
+-
+-  if (AR_init_flag == TRUE) {
+-    return ARAM_STACK_START;
+-  }
+-
+-  sAramBuffer = (u8*)calloc(1, aurora::g_config.mem2Size);
+-  if (sAramBuffer) {
+-    Log.debug("Initialized 0x{:X} bytes of ARAM!", aurora::g_config.mem2Size);
+-  } else {
+-    Log.fatal("Failed to allocate ARAM!");
++BOOL ARCheckInit() { std::lock_guard lock(mutex); return storage != nullptr; }
++u32 ARGetBaseAddress() { return base; }
++u32 ARGetSize() { std::lock_guard lock(mutex); return capacity; }
++u32 ARGetInternalSize() { return ARGetSize(); }
++void* ARGetStorageAddress() { std::lock_guard lock(mutex); return storage; }
++void ARReset() {
++  std::lock_guard lock(mutex);
++  std::free(storage); storage = nullptr; capacity = 0; lengths = nullptr;
++  blocks = used = 0; top = base; dmaCallback = nullptr;
++}
++void ARClear(u32 flag) {
++  std::lock_guard lock(mutex);
++  if (flag > AR_CLEAR_EXPANSION) throw std::invalid_argument("invalid ARAM clear region");
++  if (!storage) throw std::logic_error("ARAM is not initialized");
++  if (flag == AR_CLEAR_INTERNAL_ALL) std::memset(storage, 0, capacity);
++  else if (flag == AR_CLEAR_INTERNAL_USER) std::memset(storage + base, 0, capacity - base);
++  // This native bank has no expansion region.
++}
++ARCallback ARRegisterDMACallback(ARCallback callback) {
++  std::lock_guard lock(mutex);
++  const auto old = dmaCallback; dmaCallback = callback; return old;
++}
++u32 ARGetDMAStatus() { return 0; } // Transfers complete before the native call returns.
++void ARStartDMA(u32 type, uintptr_t mainmem, u32 aram, u32 length) {
++  ARCallback callback;
++  {
++    std::lock_guard lock(mutex);
++    transfer(type, type == ARAM_DIR_MRAM_TO_ARAM ? mainmem : aram,
++             type == ARAM_DIR_MRAM_TO_ARAM ? aram : mainmem, length);
++    callback = dmaCallback;
+   }
+-
+-  AR_StackPointer = ARAM_STACK_START;
+-  AR_FreeBlocks = num_entries;
+-  AR_BlockLength = stack_index_addr;
+-
+-  AR_init_flag = TRUE;
+-  return AR_StackPointer;
++  if (callback) callback();
+ }
+-
+-u32 ARGetSize(void) { return aurora::g_config.mem2Size; }
+-
+-#if !defined(_MSC_VER)
+-#pragma mark ARQ
+-#endif
+-void ARQPostRequest(ARQRequest* request, u32 owner, u32 type, u32 priority, uintptr_t source, uintptr_t dest,
++void ARQPostRequest(ARQRequest* request, u32, u32 type, u32 priority, uintptr_t source, uintptr_t dest,
+                     u32 length, ARQCallback callback) {
+-  // Emulate ARAM DMA transfers using memcpy.
+-  // type 0 = MRAM -> ARAM, type 1 = ARAM -> MRAM
+-  if (type == ARAM_DIR_MRAM_TO_ARAM) {
+-    // Main RAM -> ARAM: source is a host pointer (cast to u32), dest is an ARAM offset
+-    u8* hostSrc = (u8*)(uintptr_t)source;
+-    u8* aramDst = aramToHost(dest);
+-    if (aramDst && hostSrc) {
+-      memcpy(aramDst, hostSrc, length);
+-    }
+-  } else {
+-    // ARAM -> Main RAM: source is an ARAM offset, dest is a host pointer (cast to u32)
+-    u8* aramSrc = aramToHost(source);
+-    u8* hostDst = (u8*)(uintptr_t)dest;
+-    if (aramSrc && hostDst) {
+-      memcpy(hostDst, aramSrc, length);
+-    }
+-  }
+-
+-  // Immediately invoke the callback (synchronous on PC, no DMA latency)
+-  if (callback) {
+-    callback((uintptr_t)request);
++  if (!request || priority > ARQ_PRIORITY_HIGH) throw std::invalid_argument("invalid ARAM request");
++  {
++    std::lock_guard lock(mutex);
++    transfer(type, source, dest, length);
+   }
++  // Complete outside the bank lock: a callback may submit another transfer.
++  if (callback) callback(reinterpret_cast<uintptr_t>(request));
+ }
+-
+-void ARQInit() {
+-  // Nothing to do on PC - ARAM is initialized in ARInit
+-}
+-
+-void* ARGetStorageAddress() {
+-  return sAramBuffer;
++void ARQInit() { std::lock_guard lock(mutex); queueInitialized = true; }
++void ARQReset() { std::lock_guard lock(mutex); queueInitialized = false; chunkSize = ARQ_CHUNK_SIZE_DEFAULT; }
++BOOL ARQCheckInit() { std::lock_guard lock(mutex); return queueInitialized; }
++void ARQRemoveRequest(ARQRequest*) {} // Synchronous requests cannot remain queued.
++void ARQRemoveOwnerRequest(u32) {}
++void ARQFlushQueue() {}
++void ARQSetChunkSize(u32 size) {
++  if (!size || (size & 31)) throw std::invalid_argument("invalid ARAM chunk size");
++  std::lock_guard lock(mutex); chunkSize = size;
+ }
++u32 ARQGetChunkSize() { std::lock_guard lock(mutex); return chunkSize; }
+diff --git a/lib/dolphin/dvd/dvd.cpp b/lib/dolphin/dvd/dvd.cpp
+index 94481a4..4484e48 100644
+--- a/lib/dolphin/dvd/dvd.cpp
++++ b/lib/dolphin/dvd/dvd.cpp
+@@ -19,11 +19,13 @@
+ #include <string>
+ #include <thread>
+ #include <utility>
++#include <unordered_map>
+ #include <vector>
+ 
+ #include "dvd.hpp"
+ 
+ #include "../../internal.hpp"
++#include "../../host_memory.hpp"
+ 
+ using namespace aurora::dvd::impl;
+ 
+@@ -91,8 +93,19 @@ public:
+ };
+ 
+ CommandDataNod* s_disc;
++// SDK userData belongs to the application's callbacks, not the native file handle.
++std::mutex s_fileHandlesLock;
++std::unordered_map<const DVDCommandBlock*, std::unique_ptr<CommandDataBase>> s_fileHandles;
++bool hasFileHandle(const DVDCommandBlock* block) {
++  std::lock_guard lock(s_fileHandlesLock);
++  return s_fileHandles.contains(block);
++}
+ 
+ void clearState() {
++  {
++    std::lock_guard lock(s_fileHandlesLock);
++    s_fileHandles.clear();
++  }
+   if (s_partition != nullptr) {
+     nod_free(s_partition);
+     s_partition = nullptr;
+@@ -318,10 +331,9 @@ bool isCommandBlockIdle(const DVDCommandBlock* block) {
+ }
+ 
+ CommandDataBase* getCommandHandle(DVDCommandBlock* block) {
+-  if (block != nullptr && block->userData != nullptr) {
+-    return static_cast<CommandDataBase*>(block->userData);
+-  }
+-  return s_disc;
++  std::lock_guard lock(s_fileHandlesLock);
++  const auto it = s_fileHandles.find(block);
++  return it == s_fileHandles.end() ? s_disc : it->second.get();
+ }
+ 
+ void beginCommand(DVDCommandBlock* block, u32 command, void* addr, u32 length, u32 offset, DVDCBCallback callback) {
+@@ -388,6 +400,7 @@ public:
+   }
+ 
+   void enqueue(DVDCommandBlock* block) {
++    aurora::HostMemoryScope hostScope;
+     bool executeNow = false;
+     {
+       std::lock_guard lk(m_mutex);
+@@ -982,6 +995,13 @@ s32 DVDCancelAll(void) {
+ DVDDiskID* DVDGetCurrentDiskID(void) { return &s_diskID; }
+ 
+ BOOL DVDCheckDisk(void) { return s_initialized ? TRUE : FALSE; }
++BOOL DVDCheckDiskAsync(DVDCommandBlock* block, DVDCBCallback callback) {
++  if (!block || !isCommandBlockIdle(block)) return FALSE;
++  const BOOL present = DVDCheckDisk();
++  atomic_store_release(block->state, DVD_STATE_END);
++  if (callback) callback(present, block);
++  return TRUE;
++}
+ 
+ int DVDSetAutoFatalMessaging(BOOL enable) {
+   const BOOL prev = s_autoFatalMessaging;
+@@ -1060,6 +1080,7 @@ BOOL DVDConvertEntrynumToPath(s32 entrynum, char* path, u32 maxlen) {
+ }
+ 
+ BOOL DVDFastOpen(s32 entrynum, DVDFileInfo* fileInfo) {
++  aurora::HostMemoryScope hostScope;
+   std::lock_guard lock(s_fstLock);
+ 
+   if (!s_initialized || fileInfo == nullptr || !isValidEntryNum(entrynum) || s_partition == nullptr) {
+@@ -1074,6 +1095,7 @@ BOOL DVDFastOpen(s32 entrynum, DVDFileInfo* fileInfo) {
+     return FALSE;
+   }
+ 
++  if (hasFileHandle(&fileInfo->cb)) return FALSE;
+   std::memset(fileInfo, 0, sizeof(*fileInfo));
+   fileInfo->startAddr = 0;
+   fileInfo->length = entry.nextOrLength;
+@@ -1084,7 +1106,8 @@ BOOL DVDFastOpen(s32 entrynum, DVDFileInfo* fileInfo) {
+       return FALSE;
+     }
+ 
+-    fileInfo->cb.userData = new CommandDataOverlay(handle);
++    std::lock_guard lock(s_fileHandlesLock);
++    s_fileHandles.emplace(&fileInfo->cb, std::make_unique<CommandDataOverlay>(handle));
+   } else {
+     NodHandle* handle = nullptr;
+     NodResult result = nod_partition_open_file(s_partition, entry.origEntryNum, &handle);
+@@ -1092,7 +1115,8 @@ BOOL DVDFastOpen(s32 entrynum, DVDFileInfo* fileInfo) {
+       return FALSE;
+     }
+ 
+-    fileInfo->cb.userData = new CommandDataNod(handle);
++    std::lock_guard lock(s_fileHandlesLock);
++    s_fileHandles.emplace(&fileInfo->cb, std::make_unique<CommandDataNod>(handle));
+   }
+ 
+   atomic_store_release(fileInfo->cb.state, DVD_STATE_END);
+@@ -1112,9 +1136,9 @@ BOOL DVDClose(DVDFileInfo* fileInfo) {
+     return FALSE;
+   }
+   s_worker.drain_command(&fileInfo->cb);
+-  if (fileInfo->cb.userData != nullptr) {
+-    delete static_cast<CommandDataBase*>(fileInfo->cb.userData);
+-    fileInfo->cb.userData = nullptr;
++  {
++    std::lock_guard lock(s_fileHandlesLock);
++    if (!s_fileHandles.erase(&fileInfo->cb)) return FALSE;
+   }
+   atomic_store_release(fileInfo->cb.state, DVD_STATE_END);
+   return TRUE;
+@@ -1151,6 +1175,9 @@ BOOL DVDChangeDir(const char* dirName) {
+ }
+ 
+ BOOL DVDReadAsyncPrio(DVDFileInfo* fileInfo, void* addr, s32 length, s32 offset, DVDCallback callback, s32 prio) {
++  if (!fileInfo || !addr || !hasFileHandle(&fileInfo->cb) || length < 0 || offset < 0 ||
++      u64(offset) + u64(length) > u64(fileInfo->length) + DVD_MIN_TRANSFER_SIZE - 1 ||
++      u32(offset) > fileInfo->length) return FALSE;
+   ASSERTMSGLINE(0x2C7, fileInfo, "DVDReadAsync(): null pointer is specified to file info address  ");
+   ASSERTMSGLINE(0x2C8, addr, "DVDReadAsync(): null pointer is specified to addr  ");
+ 
+@@ -1180,6 +1207,7 @@ s32 DVDReadPrio(DVDFileInfo* fileInfo, void* addr, s32 length, s32 offset, s32 p
+ }
+ 
+ int DVDSeekAsyncPrio(DVDFileInfo* fileInfo, s32 offset, void (*callback)(s32, DVDFileInfo*), s32 prio) {
++  if (!fileInfo || !hasFileHandle(&fileInfo->cb)) return FALSE;
+   ASSERTMSGLINE(0x368, fileInfo, "DVDSeek(): null pointer is specified to file info address  ");
+   ASSERTMSGLINE(0x36C, !(offset & 3), "DVDSeek(): offset must be multiple of 4 byte  ");
+ 
+@@ -1294,7 +1322,7 @@ void* DVDGetFSTLocation(void) {
+ 
+ BOOL DVDPrepareStreamAsync(DVDFileInfo* fileInfo, u32 length, u32 offset, DVDCallback callback) {
+   ASSERTMSGLINE(0x46C, fileInfo, "DVDPrepareStreamAsync(): NULL file info was specified");
+-  if (fileInfo == nullptr || fileInfo->cb.userData == nullptr) {
++  if (fileInfo == nullptr || !hasFileHandle(&fileInfo->cb)) {
+     return FALSE;
+   }
+   if (length == 0) {
+diff --git a/lib/dolphin/gd/GDTexture.cpp b/lib/dolphin/gd/GDTexture.cpp
+index c3c1a6c..043174a 100644
+--- a/lib/dolphin/gd/GDTexture.cpp
++++ b/lib/dolphin/gd/GDTexture.cpp
+@@ -1,4 +1,5 @@
+ #include <dolphin/gd.h>
++#include <dolphin/gx/GXAurora.h>
+ #include <dolphin/os.h>
+ 
+ u8 GD2HWFiltConv[] = {0, 4, 1, 5, 2, 6};
+@@ -25,7 +26,7 @@ void GDSetTexImgAttr(GXTexMapID id, u16 width, u16 height, GXTexFmt format) {
+ }
+ 
+ void GDSetTexImgPtr(GXTexMapID id, void* image_ptr) {
+-    GDWriteBPCmd(BP_IMAGE_PTR(OSCachedToPhysical(image_ptr) >> 5, GDTexImage3Ids[id]));
++    GDWriteBPCmd(BP_IMAGE_PTR(AuroraRegisterTexturePointer(image_ptr), GDTexImage3Ids[id]));
+ }
+ 
+ void GDSetTexImgPtrRaw(GXTexMapID id, u32 image_ptr_raw) {
+@@ -33,7 +34,7 @@ void GDSetTexImgPtrRaw(GXTexMapID id, u32 image_ptr_raw) {
+ }
+ 
+ void GDPatchTexImgPtr(void* image_ptr) {
+-    GDWrite_u24(OSCachedToPhysical(image_ptr) >> 5);
++    GDWrite_u24(AuroraRegisterTexturePointer(image_ptr));
+ }
+ 
+ void GDSetTexCached(GXTexMapID id, u32 tmem_even, GXTexCacheSize size_even,
+@@ -86,7 +87,7 @@ void GDLoadTlut(void* tlut_ptr, u32 tmem_addr, GXTlutSize size) {
+ 
+     GDWriteBPCmd(0xFEFFFF00);
+     GDWriteBPCmd(0xF000000);
+-    GDWriteBPCmd(BP_LOAD_TLUT0(OSCachedToPhysical(tlut_ptr) >> 5, 0x64));
++    GDWriteBPCmd(BP_LOAD_TLUT0(AuroraRegisterTexturePointer(tlut_ptr), 0x64));
+     GDWriteBPCmd(BP_LOAD_TLUT1((tmem_addr - 0x80000) >> 9, size, 0x65));
+     GDWriteBPCmd(0xFEFFFF00);
+     GDWriteBPCmd(0xF000000);
+diff --git a/lib/dolphin/gx/GXAurora.cpp b/lib/dolphin/gx/GXAurora.cpp
+index 85a4285..c8abf67 100644
+--- a/lib/dolphin/gx/GXAurora.cpp
++++ b/lib/dolphin/gx/GXAurora.cpp
+@@ -1,6 +1,8 @@
+ #include "dolphin/gx/GXAurora.h"
+ 
+ #include <limits>
++#include <cstdlib>
++#include <mutex>
+ 
+ #include "__gx.h"
+ #include "gx.hpp"
+@@ -8,6 +10,45 @@
+ 
+ #include "../../gx/fifo.hpp"
+ 
++namespace {
++struct TexturePointers {
++  std::mutex mutex;
++  const void** data = nullptr;
++  u32 size = 0;
++  u32 capacity = 0;
++  ~TexturePointers() { std::free(data); }
++} texturePointers;
++constexpr u32 TexturePointerTag = 0x800000;
++}
++
++u32 AuroraRegisterTexturePointer(const void* data) {
++  if (!data) return TexturePointerTag;
++  std::lock_guard lock(texturePointers.mutex);
++  for (u32 i = 0; i < texturePointers.size; ++i)
++    if (texturePointers.data[i] == data) return TexturePointerTag | (i + 1);
++  if (texturePointers.size == TexturePointerTag - 1) Log.fatal("Native texture pointer table exhausted");
++  if (texturePointers.size == texturePointers.capacity) {
++    const auto capacity = std::min(texturePointers.capacity ? texturePointers.capacity * 2 : 256u, TexturePointerTag - 1);
++    // This table outlives scene heaps, so its storage must use the CRT directly.
++    auto* storage = static_cast<const void**>(std::realloc(texturePointers.data, capacity * sizeof(void*)));
++    if (!storage) Log.fatal("Unable to allocate native texture pointer table");
++    texturePointers.data = storage;
++    texturePointers.capacity = capacity;
++  }
++  texturePointers.data[texturePointers.size++] = data;
++  // shortcut: handles last for the process; reclaim them when display-list/resource lifetimes are ported together.
++  return TexturePointerTag | texturePointers.size;
++}
++
++const void* AuroraResolveTexturePointer(u32 handle) {
++  if (!(handle & TexturePointerTag)) return nullptr;
++  const auto index = handle & (TexturePointerTag - 1);
++  if (!index) return nullptr;
++  std::lock_guard lock(texturePointers.mutex);
++  if (index > texturePointers.size) Log.fatal("Unknown native texture pointer handle {:06x}", handle);
++  return texturePointers.data[index - 1];
++}
++
+ static void GXWriteString(const char* label) {
+   auto length = strlen(label);
+ 
+diff --git a/lib/dolphin/gx/GXCpu2Efb.cpp b/lib/dolphin/gx/GXCpu2Efb.cpp
+index 9f3f87d..6e61112 100644
+--- a/lib/dolphin/gx/GXCpu2Efb.cpp
++++ b/lib/dolphin/gx/GXCpu2Efb.cpp
+@@ -18,3 +18,19 @@ void GXPeekZ(u16 x, u16 y, u32* z) {
+ 
+   GX_WRITE_AURORA(GX_AURORA_REQUEST_DEPTH_SNAPSHOT);
+ }
++
++namespace { GXAlphaReadMode alphaRead = GX_READ_NONE; }
++void GXPokeAlphaRead(GXAlphaReadMode mode) {
++  CHECK(mode == GX_READ_00 || mode == GX_READ_FF || mode == GX_READ_NONE, "invalid alpha read mode");
++  alphaRead = mode;
++}
++void GXPeekARGB(u16 x, u16 y, u32* color) {
++  CHECK(color != nullptr, "null EFB color destination");
++  u32 value = 0;
++  // shortcut: brightness queries use the latest completed frame, synchronize snapshots if a caller needs the current unfinished frame.
++  aurora::gfx::depth_peek::read_latest_color(x, y, value);
++  if (alphaRead == GX_READ_00) value &= 0x00ffffffu;
++  if (alphaRead == GX_READ_FF) value |= 0xff000000u;
++  *color = value;
++  GX_WRITE_AURORA(GX_AURORA_REQUEST_DEPTH_SNAPSHOT);
++}
+diff --git a/lib/dolphin/gx/GXCull.cpp b/lib/dolphin/gx/GXCull.cpp
+index 0611778..f2e9525 100644
+--- a/lib/dolphin/gx/GXCull.cpp
++++ b/lib/dolphin/gx/GXCull.cpp
+@@ -19,7 +19,12 @@ void GXSetScissor(u32 left, u32 top, u32 width, u32 height) {
+   __gx->bpSent = 1;
+ }
+ 
+-// TODO GXSetScissorBoxOffset
++void GXSetScissorBoxOffset(s32 x, s32 y) {
++  const u32 ox = ((static_cast<u32>(x) + 342u) >> 1) & 1023u;
++  const u32 oy = ((static_cast<u32>(y) + 342u) >> 1) & 1023u;
++  GX_WRITE_RAS_REG(0x59000000u | ox | (oy << 10));
++  __gx->bpSent = 1;
++}
+ 
+ void GXSetCullMode(GXCullMode mode) {
+   // Swap front/back to match hardware convention
+diff --git a/lib/dolphin/gx/GXFrameBuffer.cpp b/lib/dolphin/gx/GXFrameBuffer.cpp
+index 8a3d428..1896ec3 100644
+--- a/lib/dolphin/gx/GXFrameBuffer.cpp
++++ b/lib/dolphin/gx/GXFrameBuffer.cpp
+@@ -13,6 +13,23 @@
+ #include <cmath>
+ 
+ namespace {
++u32 copy_scale(f32 scale) {
++  CHECK(std::isfinite(scale) && scale > 0.0f, "invalid display copy scale {}", scale);
++  const f32 reciprocal = 256.0f / scale;
++  CHECK(reciprocal >= 1.0f && reciprocal < 512.0f, "display copy scale outside hardware range {}", scale);
++  return static_cast<u32>(reciprocal);
++}
++
++u16 xfb_lines(u16 height, u32 scale) {
++  CHECK(height > 0 && height <= 1024, "invalid EFB height {}", height);
++  u32 result = (height - 1u) * 256u / scale + 1;
++  if (scale > 128 && scale < 256) {
++    while ((scale & 1) == 0) scale >>= 1;
++    if (height % scale == 0) ++result;
++  }
++  return static_cast<u16>(std::min(result, 1024u));
++}
++
+ aurora::Vec2<uint32_t> scale_copy_dst(u32 logicalWidth, u32 logicalHeight) {
+   if (g_gxState.viewportPolicy == AURORA_VIEWPORT_NATIVE) {
+     return {logicalWidth, logicalHeight};
+@@ -172,7 +189,11 @@ void GXSetTexCopyDst(u16 wd, u16 ht, GXTexFmt fmt, GXBool mipmap) {
+ }
+ 
+ // TODO GXSetDispCopyFrame2Field
+-// TODO GXSetCopyClamp
++void GXSetCopyClamp(GXFBClamp mode) {
++  CHECK((static_cast<u32>(mode) & ~3u) == 0, "invalid framebuffer clamp");
++  SET_REG_FIELD(0, __gx->cpTex, 1, 0, (mode & GX_CLAMP_TOP) != 0);
++  SET_REG_FIELD(0, __gx->cpTex, 1, 1, (mode & GX_CLAMP_BOTTOM) != 0);
++}
+ 
+ u32 GXSetDispCopyYScale(f32 vscale) { return 0; }
+ 
+@@ -216,8 +237,30 @@ void GXCopyTex(void* dest, GXBool clear) {
+   aurora::gx::fifo::publish();
+ }
+ 
+-// TODO GXGetYScaleFactor
+-// TODO GXGetNumXfbLines
++u16 GXGetNumXfbLines(u16 efbHeight, f32 yScale) {
++  return xfb_lines(efbHeight, copy_scale(yScale));
++}
++
++f32 GXGetYScaleFactor(u16 efbHeight, u16 xfbHeight) {
++  CHECK(efbHeight > 0 && efbHeight <= 1024 && xfbHeight > 0 && xfbHeight <= 1024,
++        "invalid display copy heights {} to {}", efbHeight, xfbHeight);
++  u32 target = xfbHeight;
++  f32 scale = static_cast<f32>(target) / efbHeight;
++  u16 height = GXGetNumXfbLines(efbHeight, scale);
++  while (height > xfbHeight) {
++    CHECK(target > 1, "unrepresentable display copy height {}", xfbHeight);
++    scale = static_cast<f32>(--target) / efbHeight;
++    height = GXGetNumXfbLines(efbHeight, scale);
++  }
++  f32 result = scale;
++  while (height < xfbHeight) {
++    result = scale;
++    CHECK(target < 1024, "unrepresentable display copy height {}", xfbHeight);
++    scale = static_cast<f32>(++target) / efbHeight;
++    height = GXGetNumXfbLines(efbHeight, scale);
++  }
++  return result;
++}
+ // TODO GXClearBoundingBox
+ // TODO GXReadBoundingBox
+ }
+diff --git a/lib/dolphin/gx/GXGeometry.cpp b/lib/dolphin/gx/GXGeometry.cpp
+index fc0e27e..432ad24 100644
+--- a/lib/dolphin/gx/GXGeometry.cpp
++++ b/lib/dolphin/gx/GXGeometry.cpp
+@@ -222,7 +222,9 @@ void GXSetArray(GXAttr attr, const void* data, u32 size, u8 stride, bool le) {
+   }
+   u32 cpIdx = cpAttr - GX_VA_POS;
+ 
+-  assert((cpIdx & ~0xF) == 0);
++  CHECK((cpIdx & ~0xF) == 0, "invalid vertex array attribute {}", underlying(attr));
++  CHECK(((data != nullptr && size > 0) || (data == nullptr && size == 0)) && stride > 0,
++        "invalid vertex array binding");
+ 
+   // Write array base
+   GX_WRITE_AURORA(GX_AURORA_LOAD_ARRAYBASE | cpIdx);
+diff --git a/lib/dolphin/gx/GXGet.cpp b/lib/dolphin/gx/GXGet.cpp
+index af9d290..6b741e3 100644
+--- a/lib/dolphin/gx/GXGet.cpp
++++ b/lib/dolphin/gx/GXGet.cpp
+@@ -324,7 +324,17 @@ GXTexWrapMode GXGetTexObjWrapT(const GXTexObj* tex_obj) {
+ 
+ GXBool GXGetTexObjMipMap(const GXTexObj* tex_obj) { return reinterpret_cast<const GXTexObj_*>(tex_obj)->has_mips(); }
+ 
+-// TODO GXGetTexObjAll
++void GXGetTexObjAll(const GXTexObj* obj, void** image, u16* width, u16* height, GXTexFmt* format,
++                    GXTexWrapMode* wrapS, GXTexWrapMode* wrapT, GXBool* mipmap) {
++  CHECK(obj && image && width && height && format && wrapS && wrapT && mipmap, "null texture query");
++  *image = GXGetTexObjData(obj);
++  *width = GXGetTexObjWidth(obj);
++  *height = GXGetTexObjHeight(obj);
++  *format = GXGetTexObjFmt(obj);
++  *wrapS = GXGetTexObjWrapS(obj);
++  *wrapT = GXGetTexObjWrapT(obj);
++  *mipmap = GXGetTexObjMipMap(obj);
++}
+ // TODO GXGetTexObjMinFilt
+ // TODO GXGetTexObjMagFilt
+ // TODO GXGetTexObjMinLOD
+@@ -333,7 +343,21 @@ GXBool GXGetTexObjMipMap(const GXTexObj* tex_obj) { return reinterpret_cast<cons
+ // TODO GXGetTexObjBiasClamp
+ // TODO GXGetTexObjEdgeLOD
+ // TODO GXGetTexObjMaxAniso
+-// TODO GXGetTexObjLODAll
++void GXGetTexObjLODAll(const GXTexObj* obj, GXTexFilter* minFilter, GXTexFilter* magFilter,
++                       f32* minLod, f32* maxLod, f32* bias, GXBool* biasClamp,
++                       GXBool* edgeLod, GXAnisotropy* anisotropy) {
++  CHECK(obj && minFilter && magFilter && minLod && maxLod && bias && biasClamp && edgeLod && anisotropy,
++        "null texture LOD query");
++  const auto& texture = *reinterpret_cast<const GXTexObj_*>(obj);
++  *minFilter = texture.min_filter();
++  *magFilter = texture.mag_filter();
++  *minLod = texture.min_lod();
++  *maxLod = texture.max_lod();
++  *bias = texture.lod_bias();
++  *biasClamp = texture.bias_clamp();
++  *edgeLod = texture.do_edge_lod();
++  *anisotropy = texture.max_aniso();
++}
+ u32 GXGetTexObjTlut(const GXTexObj* tex_obj) { return reinterpret_cast<const GXTexObj_*>(tex_obj)->tlut; }
+ // TODO GXGetTlutObjData
+ // TODO GXGetTlutObjFmt
+diff --git a/lib/dolphin/gx/GXManage.cpp b/lib/dolphin/gx/GXManage.cpp
+index 7e62821..5dde3b2 100644
+--- a/lib/dolphin/gx/GXManage.cpp
++++ b/lib/dolphin/gx/GXManage.cpp
+@@ -13,6 +13,24 @@ static GXFifoObj sFifoObj;
+ constexpr u32 kDrawDoneCommand = static_cast<u32>(GX_BP_REG_DRAWDONE) << 24 | 2;
+ 
+ extern "C" {
++void GXSetMisc(GXMiscToken token, u32 value) {
++  switch (token) {
++  case GX_MT_NULL:
++    return;
++  case GX_MT_XF_FLUSH:
++    CHECK(value <= 65535, "invalid XF flush vertex count {}", value);
++    __gx->vNum = static_cast<u16>(value);
++    __gx->bpSent = 0;
++    if (value != 0) __gx->dirtyState |= 8;
++    return;
++  case GX_MT_DL_SAVE_CONTEXT:
++    __gx->dlSaveContext = value != 0;
++    return;
++  default:
++    CHECK(false, "unsupported GX miscellaneous token {}", underlying(token));
++  }
++}
++
+ GXFifoObj* GXInit(void* base, u32 size) {
+   GXRenderModeObj* rmode;
+   f32 identity_mtx[3][4];
+@@ -23,6 +41,8 @@ GXFifoObj* GXInit(void* base, u32 size) {
+ 
+   std::memset(&sGXData, 0, sizeof(sGXData));
+   __gx = &sGXData;
++  __gx->zScale = 1.6777215e7f;
++  __gx->zOffset = 0.f;
+   __gx->inDispList = 0;
+   __gx->dlSaveContext = 1;
+   __gx->tcsManEnab = 0;
+@@ -265,6 +285,22 @@ void GXDrawDone() {
+   GXFlush();
+   GX_WRITE_RAS_REG(kDrawDoneCommand);
+   aurora::gx::fifo::drain();
++  aurora::gx::fifo::dispatch_draw_sync();
++}
++
++void GXSetDrawSync(u16 token) {
++  GXFlush();
++  GX_WRITE_RAS_REG(0x48000000u | token);
++  GX_WRITE_RAS_REG(0x47000000u | token);
++  if (!aurora::gx::fifo::in_display_list()) {
++    aurora::gx::fifo::drain();
++    aurora::gx::fifo::dispatch_draw_sync();
++  }
++  __gx->bpSent = 0;
++}
++u16 GXReadDrawSync() { return aurora::gx::fifo::read_draw_sync(); }
++GXDrawSyncCallback GXSetDrawSyncCallback(GXDrawSyncCallback callback) {
++  return aurora::gx::fifo::set_draw_sync_callback(callback);
+ }
+ 
+ void GXSetDrawDone() {
+diff --git a/lib/dolphin/gx/GXTev.cpp b/lib/dolphin/gx/GXTev.cpp
+index 5b88284..89cbbc6 100644
+--- a/lib/dolphin/gx/GXTev.cpp
++++ b/lib/dolphin/gx/GXTev.cpp
+@@ -169,7 +169,12 @@ void GXSetTevOrder(GXTevStageID id, GXTexCoordID tcid, GXTexMapID tmid, GXChanne
+ }
+ 
+ void GXSetZTexture(GXZTexOp op, GXTexFmt fmt, u32 bias) {
+-  // TODO
++  CHECK(op <= GX_ZT_REPLACE, "invalid depth texture operation {}", underlying(op));
++  CHECK(fmt == GX_TF_Z8 || fmt == GX_TF_Z16 || fmt == GX_TF_Z24X8, "invalid depth texture format {}", underlying(fmt));
++  const u32 type = fmt == GX_TF_Z8 ? 0 : fmt == GX_TF_Z16 ? 1 : 2;
++  GX_WRITE_RAS_REG(0xF4000000u | (bias & 0xFFFFFFu));
++  GX_WRITE_RAS_REG(0xF5000000u | type | (u32(op) << 2));
++  __gx->bpSent = 1;
+ }
+ 
+ void GXSetNumTevStages(u8 num) {
+diff --git a/lib/dolphin/gx/GXTexture.cpp b/lib/dolphin/gx/GXTexture.cpp
+index 04f97f5..ae7c444 100644
+--- a/lib/dolphin/gx/GXTexture.cpp
++++ b/lib/dolphin/gx/GXTexture.cpp
+@@ -85,7 +85,7 @@ void emit_loaded_texobj_metadata(const GXTexObj_& obj, GXTexMapID id) {
+   GX_WRITE_U32(obj.height());
+   GX_WRITE_U32(obj.format());
+   GX_WRITE_U32(static_cast<u32>(obj.tlut));
+-  GX_WRITE_U8(static_cast<u8>(obj.has_mips()));
++  GX_WRITE_U8(obj.flags & 0x41u);
+   GX_WRITE_U32(obj.texObjId);
+   GX_WRITE_U32(obj.texDataVersion);
+ }
+@@ -108,6 +108,17 @@ void GXInitTexObj(GXTexObj* obj_, const void* data, u16 width, u16 height, GXTex
+   init_texobj_common(*obj, data, width, height, format, wrapS, wrapT, mipmap);
+ }
+ 
++void GXInitTexObjStreaming(GXTexObj* obj_, const void* data, u16 width, u16 height, GXTexFmt format) {
++  auto& obj = *reinterpret_cast<GXTexObj_*>(obj_);
++  if (obj.texObjId == 0 || !obj.is_streaming() || obj.width() != width || obj.height() != height || obj.format() != format) {
++    GXDestroyTexObj(obj_);
++    init_texobj_common(obj, data, width, height, format, GX_CLAMP, GX_CLAMP, GX_FALSE);
++    obj.flags |= 0x40;
++  } else {
++    GXInitTexObjData(obj_, data);
++  }
++}
++
+ void GXInitTexObjCI(GXTexObj* obj_, const void* data, u16 width, u16 height, GXCITexFmt format, GXTexWrapMode wrapS,
+                     GXTexWrapMode wrapT, GXBool mipmap, u32 tlut) {
+   auto* obj = reinterpret_cast<GXTexObj_*>(obj_);
+@@ -339,7 +350,19 @@ void GXLoadTlut(const GXTlutObj* obj_, u32 idx) {
+   emit_loaded_tlut_metadata(*obj, idx);
+ }
+ 
+-// TODO GXInitTexCacheRegion
++void GXInitTexCacheRegion(GXTexRegion* region, GXBool mipmap32, u32 even, GXTexCacheSize evenSize,
++                          u32 odd, GXTexCacheSize oddSize) {
++  CHECK(region != nullptr && (even & 31) == 0 && (odd & 31) == 0 && even < 0x100000 && odd < 0x100000,
++        "invalid texture cache region addresses");
++  CHECK(evenSize <= GX_TEXCACHE_512K && oddSize <= GX_TEXCACHE_NONE, "invalid texture cache region size");
++  const u32 evenExp = underlying(evenSize) + 3;
++  const u32 oddExp = oddSize == GX_TEXCACHE_NONE ? 0 : underlying(oddSize) + 3;
++  struct Region { u32 image1, image2; u16 sizeEven, sizeOdd; u8 mipmap32, cached; u16 padding; };
++  static_assert(sizeof(Region) == sizeof(GXTexRegion));
++  const Region value{(even >> 5) | evenExp << 15 | evenExp << 18,
++                     (odd >> 5) | oddExp << 15 | oddExp << 18, 0, 0, u8(mipmap32 != GX_FALSE), 1, 0};
++  std::memcpy(region, &value, sizeof(value));
++}
+ // TODO GXInitTexPreLoadRegion
+ // TODO GXInitTlutRegion
+ // TODO GXInvalidateTexRegion
+diff --git a/lib/dolphin/gx/GXTransform.cpp b/lib/dolphin/gx/GXTransform.cpp
+index f443204..3fae391 100644
+--- a/lib/dolphin/gx/GXTransform.cpp
++++ b/lib/dolphin/gx/GXTransform.cpp
+@@ -1,4 +1,5 @@
+ #include "gx.hpp"
++#include <cmath>
+ #include "__gx.h"
+ #include "dolphin/mtx/GeoTypes.h"
+ 
+@@ -142,10 +143,10 @@ void GXSetViewportJitter(float left, float top, float width, float height, float
+   sy = -height / 2.0f;
+   ox = 340.0f + (left + width / 2.0f);
+   oy = 340.0f + (top + height / 2.0f);
+-  zmin = 1.6777215e7f * nearZ;
+-  zmax = 1.6777215e7f * farZ;
++  zmin = __gx->zScale * nearZ;
++  zmax = __gx->zScale * farZ;
+   sz = zmax - zmin;
+-  oz = zmax;
++  oz = zmax + __gx->zOffset;
+ 
+   __gx->vpLeft = left;
+   __gx->vpTop = top;
+@@ -194,6 +195,21 @@ void GXProject(f32 x, f32 y, f32 z, const f32 mtx[3][4], const f32* pm, const f3
+ 
+ // TODO GXLoadNrmMtxImm3x3
+ // TODO GXLoadNrmMtxIndx3x3
+-// TODO GXLoadTexMtxIndx
+-// TODO GXSetZScaleOffset
++void GXLoadTexMtxIndx(u16 index, u32 id, GXTexMtxType type) {
++  CHECK((id >= GX_TEXMTX0 && id < GX_IDENTITY && (id - GX_TEXMTX0) % 3 == 0) ||
++        (id >= GX_PTTEXMTX0 && id < GX_PTIDENTITY && (id - GX_PTTEXMTX0) % 3 == 0),
++        "invalid indexed texture matrix {}", id);
++  CHECK(type == GX_MTX2x4 || type == GX_MTX3x4, "invalid texture matrix type {}", underlying(type));
++  CHECK(id < GX_PTTEXMTX0 || type == GX_MTX3x4, "post texture matrix requires three rows");
++  const u32 address = id >= GX_PTTEXMTX0 ? (id - GX_PTTEXMTX0) * 4 + 0x500 : id * 4;
++  GX_WRITE_U8(GX_LOAD_INDX_C);
++  GX_WRITE_U16(index);
++  GX_WRITE_U16(((type == GX_MTX2x4 ? 7u : 11u) << 12) | address);
++}
++void GXSetZScaleOffset(f32 scale, f32 offset) {
++  CHECK(std::isfinite(scale) && std::isfinite(offset) && scale >= 0.f, "invalid depth scale/offset");
++  __gx->zScale = scale * 1.6777215e7f + 1.f;
++  __gx->zOffset = offset * 1.6777215e7f;
++  GXSetViewport(__gx->vpLeft, __gx->vpTop, __gx->vpWd, __gx->vpHt, __gx->vpNearz, __gx->vpFarz);
++}
+ }
+diff --git a/lib/dolphin/gx/GXVert.cpp b/lib/dolphin/gx/GXVert.cpp
+index 789ed14..8273881 100644
+--- a/lib/dolphin/gx/GXVert.cpp
++++ b/lib/dolphin/gx/GXVert.cpp
+@@ -239,6 +239,7 @@ void GXTexCoord1x16(u16 index) { GX_WRITE_U16(index); }
+ 
+ void GXTexCoord1x8(u8 index) { GX_WRITE_U8(index); }
+ 
++void GXCmd1f32(const f32 x) { aurora::gx::fifo::write_f32(x); }
+ void GXCmd1u8(const u8 x) { aurora::gx::fifo::write_u8(x); }
+ void GXCmd1u16(const u16 x) { aurora::gx::fifo::write_u16(x); }
+ void GXCmd1u32(const u32 x) { aurora::gx::fifo::write_u32(x); }
+diff --git a/lib/dolphin/gx/__gx.h b/lib/dolphin/gx/__gx.h
+index 253fade..56626a8 100644
+--- a/lib/dolphin/gx/__gx.h
++++ b/lib/dolphin/gx/__gx.h
+@@ -145,6 +145,8 @@ struct __GXData_struct {
+   f32 vpWd;         // viewport width
+   f32 vpHt;         // viewport height
+   f32 vpNearz;      // viewport near Z
++  f32 zScale = 1.6777215e7f;
++  f32 zOffset = 0.f;
+   f32 vpFarz;       // viewport far Z
+ 
+   u8 fgRange;       // fog range adjustment enabled
+diff --git a/lib/dolphin/thp/THPAudio.cpp b/lib/dolphin/thp/THPAudio.cpp
+index 3fcae7b..5c51f02 100644
+--- a/lib/dolphin/thp/THPAudio.cpp
++++ b/lib/dolphin/thp/THPAudio.cpp
+@@ -95,12 +95,24 @@ void decode_channel(s16* output, size_t stride, const u8* encoded, u32 sampleCou
+ } // namespace
+ 
+ extern "C" {
+-u32 THPAudioDecode(s16* output, const u8* frame, s32 flag) {
+-  if (output == nullptr || frame == nullptr) {
++u32 THPAudioDecodeSized(s16* output, size_t sampleCapacity, const u8* frame, size_t frameSize, s32 flag) {
++  if (output == nullptr || frame == nullptr || frameSize < kHeaderSize || (flag != 0 && flag != 1)) {
+     return 0;
+   }
+ 
+   const AudioHeader header = read_header(frame);
++  if (header.sampleCount == 0 || header.sampleCount > sampleCapacity / 2) return 0;
++  const size_t channelBytes = ((size_t(header.sampleCount) + 13) / 14) * 8;
++  const size_t dataSize = frameSize - kHeaderSize;
++  if (channelBytes > dataSize || (header.nextChannelOffset != 0 &&
++      (header.nextChannelOffset < channelBytes || header.nextChannelOffset > dataSize ||
++       channelBytes > dataSize - header.nextChannelOffset))) return 0;
++  const auto validPredictors = [&](const u8* data) {
++    for (size_t i = 0; i < channelBytes; i += 8) if ((data[i] >> 4) >= 8) return false;
++    return true;
++  };
++  if (!validPredictors(frame + kHeaderSize) || (header.nextChannelOffset != 0 &&
++      !validPredictors(frame + kHeaderSize + header.nextChannelOffset))) return 0;
+   const size_t stride = flag == 1 ? 1 : 2;
+   s16* rightOutput = output;
+   s16* leftOutput = flag == 1 ? output + header.sampleCount : output + 1;
+@@ -117,4 +129,10 @@ u32 THPAudioDecode(s16* output, const u8* frame, s32 flag) {
+   }
+   return header.sampleCount;
+ }
++
++u32 THPAudioDecode(s16* output, const u8* frame, s32 flag) {
++  // The SDK API cannot validate extents; native game callers use THPAudioDecodeSized.
++  constexpr size_t unbounded = std::numeric_limits<size_t>::max();
++  return THPAudioDecodeSized(output, unbounded, frame, unbounded, flag);
++}
+ }
+diff --git a/lib/dolphin/thp/THPDec.cpp b/lib/dolphin/thp/THPDec.cpp
+index 8c9db49..d4ff4d2 100644
+--- a/lib/dolphin/thp/THPDec.cpp
++++ b/lib/dolphin/thp/THPDec.cpp
+@@ -5,6 +5,7 @@
+ #include <algorithm>
+ #include <array>
+ #include <cmath>
++#include <limits>
+ 
+ namespace {
+ // Error codes
+@@ -214,8 +215,8 @@ s32 parse_scan_header(const u8* data, size_t size, DecodeContext& context) noexc
+   return 0;
+ }
+ 
+-s32 parse_headers(const void* file, DecodeContext& context) noexcept {
+-  auto reader = aurora::ByteReader::unbounded(file);
++s32 parse_headers(const void* file, size_t fileSize, DecodeContext& context) noexcept {
++  aurora::ByteReader reader{static_cast<const u8*>(file), fileSize};
+   while (true) {
+     u8 prefix = 0;
+     if (!reader.try_read(prefix) || prefix != 0xFF) {
+@@ -297,12 +298,16 @@ s32 parse_headers(const void* file, DecodeContext& context) noexcept {
+ 
+ class BitReader {
+ public:
+-  BitReader(const u8* data, size_t byteOffset) noexcept : mData{data}, mBitPosition{byteOffset * 8} {}
++  BitReader(const u8* data, size_t size, size_t byteOffset) noexcept
++  : mData{data}, mSize{size}, mBitPosition{byteOffset * 8} {}
++
++  bool failed() const noexcept { return mFailed; }
+ 
+   u32 read(u8 count) noexcept {
+     u32 value = 0;
+     for (u8 i = 0; i < count; ++i) {
+       const size_t bytePosition = mBitPosition >> 3;
++      if (bytePosition >= mSize) { mFailed = true; return 0; }
+       value = (value << 1) | ((mData[bytePosition] >> (7 - (mBitPosition & 7))) & 1);
+       ++mBitPosition;
+     }
+@@ -313,7 +318,9 @@ public:
+ 
+ private:
+   const u8* mData;
++  size_t mSize;
+   size_t mBitPosition;
++  bool mFailed = false;
+ };
+ 
+ bool decode_huffman(BitReader& reader, const HuffmanTable& table, u8& symbol) noexcept {
+@@ -345,11 +352,12 @@ bool decode_block(BitReader& reader, DecodeContext& context, size_t componentInd
+   const HuffmanTable& acTable = context.huffmanTables[component.acTable * 2 + 1];
+ 
+   u8 bitCount = 0;
+-  if (!decode_huffman(reader, dcTable, bitCount) || bitCount > 16) {
++  if (!decode_huffman(reader, dcTable, bitCount) || bitCount > 11) {
+     return false;
+   }
+   const u32 encodedDifference = reader.read(bitCount);
+   component.predictedDc += extend_value(encodedDifference, bitCount);
++  if (component.predictedDc < -2048 || component.predictedDc > 2047) return false;
+   block[0] = static_cast<s16>(component.predictedDc);
+ 
+   size_t coefficient = 1;
+@@ -363,10 +371,13 @@ bool decode_block(BitReader& reader, DecodeContext& context, size_t componentInd
+     if (bitCount == 0) {
+       if (run == 15) {
+         coefficient += 16;
++        if (coefficient > 64) return false;
+         continue;
+       }
++      if (run != 0) return false;
+       break;
+     }
++    if (bitCount > 10) return false;
+ 
+     coefficient += run;
+     if (coefficient >= 64) {
+@@ -521,7 +532,7 @@ void write_block(u8* output, u16 width, u16 height, u16 blockX, u16 blockY, cons
+ bool decode_and_write_block(BitReader& reader, DecodeContext& context, size_t component, u8* output, u16 width,
+                             u16 height, u16 x, u16 y) noexcept {
+   std::array<s16, 64> coefficients{};
+-  if (!decode_block(reader, context, component, coefficients)) {
++  if (!decode_block(reader, context, component, coefficients) || reader.failed()) {
+     return false;
+   }
+   const QuantizationTable& quantization = context.quantizationTables[context.components[component].quantizationTable];
+@@ -536,7 +547,8 @@ bool decode_and_write_block(BitReader& reader, DecodeContext& context, size_t co
+ extern "C" {
+ BOOL THPInit(void) { return TRUE; }
+ 
+-s32 THPVideoDecode(const void* file, void* tileY, void* tileU, void* tileV, void*) {
++s32 THPVideoDecodeSized(const void* file, size_t fileSize, void* tileY, size_t ySize,
++                        void* tileU, size_t uSize, void* tileV, size_t vSize, u32 width, u32 height) {
+   if (file == nullptr) {
+     return kNoInput;
+   }
+@@ -545,7 +557,7 @@ s32 THPVideoDecode(const void* file, void* tileY, void* tileU, void* tileV, void
+   }
+ 
+   DecodeContext context{};
+-  const s32 headerResult = parse_headers(file, context);
++  const s32 headerResult = parse_headers(file, fileSize, context);
+   if (headerResult != 0) {
+     return headerResult;
+   }
+@@ -553,7 +565,14 @@ s32 THPVideoDecode(const void* file, void* tileY, void* tileU, void* tileV, void
+   const u16 chromaWidth = static_cast<u16>((context.width + 1) / 2);
+   const u16 chromaHeight = static_cast<u16>((context.height + 1) / 2);
+ 
+-  BitReader bits{static_cast<const uint8_t*>(file), context.scanOffset};
++  const auto tileSize = [](u32 w, u32 h) -> size_t {
++    return size_t((w + 7) / 8) * ((h + 3) / 4) * 32;
++  };
++  if ((width != 0 && context.width != width) || (height != 0 && context.height != height)) return kBadSyntax;
++  if (ySize < tileSize(context.width, context.height) || uSize < tileSize(chromaWidth, chromaHeight) ||
++      vSize < tileSize(chromaWidth, chromaHeight)) return kNoOutput;
++
++  BitReader bits{static_cast<const uint8_t*>(file), fileSize, context.scanOffset};
+   const u16 mcuColumns = static_cast<u16>((context.width + 15) / 16);
+   const u16 mcuRows = static_cast<u16>((context.height + 15) / 16);
+   u32 restartCount = 0;
+@@ -587,4 +606,10 @@ s32 THPVideoDecode(const void* file, void* tileY, void* tileU, void* tileV, void
+   }
+   return 0;
+ }
++
++s32 THPVideoDecode(const void* file, void* tileY, void* tileU, void* tileV, void*) {
++  // The SDK API cannot validate extents; native game callers use THPVideoDecodeSized.
++  constexpr size_t unbounded = std::numeric_limits<size_t>::max();
++  return THPVideoDecodeSized(file, unbounded, tileY, unbounded, tileU, unbounded, tileV, unbounded, 0, 0);
++}
+ }
+diff --git a/lib/dolphin/vi/vi.cpp b/lib/dolphin/vi/vi.cpp
+index 4c8dddc..803ff5a 100644
+--- a/lib/dolphin/vi/vi.cpp
++++ b/lib/dolphin/vi/vi.cpp
+@@ -5,9 +5,29 @@
+ #include "vi_internal.hpp"
+ 
+ #include <optional>
++#include <chrono>
++#include <mutex>
++#include <thread>
++#include <utility>
++#include <algorithm>
++#include <SDL3/SDL.h>
++#define WIN32_LEAN_AND_MEAN
++#include <windows.h>
++
++namespace {
++std::recursive_mutex retraceMutex;
++u32 retraceCount = 0;
++VIRetraceCallback preRetrace = nullptr, postRetrace = nullptr;
++void* nextFrameBuffer = nullptr;
++void* currentFrameBuffer = nullptr;
++bool black = false;
++bool dimming = true;
++auto nextRetrace = std::chrono::steady_clock::now();
++}
+ 
+ namespace aurora::vi {
+ std::optional<GXRenderModeObj> g_renderMode;
++bool is_black() noexcept { std::lock_guard lock(retraceMutex); return black; }
+ 
+ Vec2<uint32_t> render_mode_size() noexcept {
+   if (!g_renderMode) {
+@@ -45,6 +65,54 @@ void VIConfigurePan(u16 xOrg, u16 yOrg, u16 width, u16 height) {
+ u32 VIGetTvFormat() { return 0; }
+ void VIFlush() {}
+ 
++void VIWaitForRetrace() {
++  std::lock_guard lock(retraceMutex);
++  using Clock = std::chrono::steady_clock;
++  const bool pal = aurora::vi::g_renderMode && (aurora::vi::g_renderMode->viTVmode >> 2) == 1;
++  const auto period = std::chrono::nanoseconds(pal ? 20000000 : 16666667);
++  const auto now = Clock::now();
++  nextRetrace += period;
++  // Late decoding has already spent the frame budget; do not add another full frame of sleep.
++  if (nextRetrace < now) nextRetrace = now;
++  std::this_thread::sleep_until(nextRetrace);
++  VIAdvanceRetrace();
++}
++void VIAdvanceRetrace() {
++  std::lock_guard lock(retraceMutex);
++  ++retraceCount;
++  if (preRetrace) preRetrace(retraceCount);
++  currentFrameBuffer = nextFrameBuffer;
++  if (postRetrace) postRetrace(retraceCount);
++}
++u32 VIGetRetraceCount() { std::lock_guard lock(retraceMutex); return retraceCount; }
++u32 VIGetDTVStatus() { return 1; }
++void* VIGetCurrentFrameBuffer() { std::lock_guard lock(retraceMutex); return currentFrameBuffer; }
++void* VIGetNextFrameBuffer() { std::lock_guard lock(retraceMutex); return nextFrameBuffer; }
++void VISetNextFrameBuffer(void* fb) { std::lock_guard lock(retraceMutex); nextFrameBuffer = fb; }
++void VISetBlack(BOOL value) { std::lock_guard lock(retraceMutex); black = value != 0; }
++VIRetraceCallback VISetPreRetraceCallback(VIRetraceCallback cb) {
++  std::lock_guard lock(retraceMutex); return std::exchange(preRetrace, cb);
++}
++VIRetraceCallback VISetPostRetraceCallback(VIRetraceCallback cb) {
++  std::lock_guard lock(retraceMutex); return std::exchange(postRetrace, cb);
++}
++BOOL VIEnableDimming(BOOL value) {
++  std::lock_guard lock(retraceMutex);
++  const bool old = dimming;
++  dimming = value != 0;
++  if (dimming) SDL_EnableScreenSaver(); else SDL_DisableScreenSaver();
++  return old;
++}
++u32 VIGetDimmingCount() {
++  std::lock_guard lock(retraceMutex);
++  LASTINPUTINFO input{sizeof(input)};
++  if (!dimming || !GetLastInputInfo(&input)) return 18000;
++  const u32 idleMs = GetTickCount() - input.dwTime;
++  return idleMs >= 300000 ? 0 : (300000 - idleMs) * 60 / 1000;
++}
++// Digital output has no analog trap filter.
++void VISetTrapFilter(BOOL) {}
++
+ void VISetWindowTitle(const char* title) { aurora::window::set_title(title); }
+ void VISetWindowFullscreen(bool fullscreen) { aurora::window::set_fullscreen(fullscreen); }
+ bool VIGetWindowFullscreen() { return aurora::window::get_fullscreen(); }
+diff --git a/lib/dolphin/vi/vi_internal.hpp b/lib/dolphin/vi/vi_internal.hpp
+index a711c3f..f5a2aba 100644
+--- a/lib/dolphin/vi/vi_internal.hpp
++++ b/lib/dolphin/vi/vi_internal.hpp
+@@ -7,6 +7,7 @@
+ #include <aurora/math.hpp>
+ 
+ namespace aurora::vi {
++bool is_black() noexcept;
+ void configure(const GXRenderModeObj* rm) noexcept;
+ Vec2<uint32_t> configured_fb_size() noexcept;
+ } // namespace aurora::vi
+diff --git a/lib/gfx/depth_peek.cpp b/lib/gfx/depth_peek.cpp
+index 08f7743..03b08bf 100644
+--- a/lib/gfx/depth_peek.cpp
++++ b/lib/gfx/depth_peek.cpp
+@@ -47,6 +47,7 @@ struct LatestSnapshot {
+   uint32_t width = 0;
+   uint32_t height = 0;
+   std::vector<uint32_t> data;
++  std::vector<uint32_t> colors;
+ };
+ 
+ enum class SlotState : uint8_t {
+@@ -76,6 +77,8 @@ std::array<Slot, SlotCount> g_slots;
+ size_t g_nextSlot = 0;
+ wgpu::BindGroupLayout g_bindGroupLayout;
+ wgpu::ComputePipeline g_pipeline;
++wgpu::BindGroupLayout g_bindGroupLayoutMS;
++wgpu::ComputePipeline g_pipelineMS;
+ bool g_snapshotRequested = false;
+ Clock::time_point g_nextSnapshotTime;
+ LatestSnapshot g_latest;
+@@ -89,7 +92,8 @@ struct Params {
+     scale: vec2f,
+ };
+ 
+-@group(0) @binding(1) var<storage, read_write> out_z: array<u32>;
++@group(0) @binding(1) var<storage, read_write> out_z: array<vec2u>;
++@group(0) @binding(3) var src_color: texture_2d<f32>;
+ @group(0) @binding(2) var<uniform> params: Params;
+ )"sv;
+ 
+@@ -122,21 +126,24 @@ fn cs_main(@builtin(global_invocation_id) id: vec3u) {
+     let srcPixel = clamp(vec2i(floor(params.offset + dstCenter * params.scale)), vec2i(0, 0),
+                          vec2i(params.srcSize) - vec2i(1, 1));
+     let depth = load_depth(srcPixel);
+-    out_z[id.y * params.dstSize.x + id.x] = gx_z24(depth);
++    let rgba = vec4u(round(clamp(textureLoad(src_color, srcPixel, 0), vec4f(0.0), vec4f(1.0)) * 255.0));
++    let argb = (rgba.a << 24u) | (rgba.r << 16u) | (rgba.g << 8u) | rgba.b;
++    out_z[id.y * params.dstSize.x + id.x] = vec2u(gx_z24(depth), argb);
+ }
+ )"sv;
+ 
+-std::string build_shader_source() {
++std::string build_shader_source(bool multisampled) {
+   std::string source;
+   source.reserve(ShaderPreamble.size() + ReversedZBody.size() + ShaderMain.size());
+   source += ShaderPreamble;
+   source += gx::UseReversedZ ? ReversedZBody : ForwardZBody;
+   source += ShaderMain;
++  if(multisampled) source.replace(source.find("texture_depth_2d"), std::string_view("texture_depth_2d").size(), "texture_depth_multisampled_2d");
+   return source;
+ }
+ 
+-wgpu::ComputePipeline create_pipeline(const wgpu::BindGroupLayout& bindGroupLayout, const char* label) {
+-  const auto shaderSource = build_shader_source();
++wgpu::ComputePipeline create_pipeline(const wgpu::BindGroupLayout& bindGroupLayout, const char* label, bool multisampled=false) {
++  const auto shaderSource = build_shader_source(multisampled);
+   const wgpu::ShaderSourceWGSL wgslSource{wgpu::ShaderSourceWGSL::Init{
+       .code = shaderSource.c_str(),
+   }};
+@@ -163,8 +170,8 @@ wgpu::ComputePipeline create_pipeline(const wgpu::BindGroupLayout& bindGroupLayo
+   return g_device.CreateComputePipeline(&pipelineDescriptor);
+ }
+ 
+-wgpu::BindGroupLayout create_bind_group_layout(const char* label) {
+-  constexpr std::array entries{
++wgpu::BindGroupLayout create_bind_group_layout(const char* label, bool multisampled=false) {
++  const std::array entries{
+       wgpu::BindGroupLayoutEntry{
+           .binding = 0,
+           .visibility = wgpu::ShaderStage::Compute,
+@@ -172,6 +179,7 @@ wgpu::BindGroupLayout create_bind_group_layout(const char* label) {
+               wgpu::TextureBindingLayout{
+                   .sampleType = wgpu::TextureSampleType::Depth,
+                   .viewDimension = wgpu::TextureViewDimension::e2D,
++                  .multisampled = multisampled,
+               },
+       },
+       wgpu::BindGroupLayoutEntry{
+@@ -190,6 +198,12 @@ wgpu::BindGroupLayout create_bind_group_layout(const char* label) {
+                   .type = wgpu::BufferBindingType::Uniform,
+               },
+       },
++      wgpu::BindGroupLayoutEntry{
++          .binding = 3,
++          .visibility = wgpu::ShaderStage::Compute,
++          .texture = wgpu::TextureBindingLayout{.sampleType = wgpu::TextureSampleType::Float,
++                                                .viewDimension = wgpu::TextureViewDimension::e2D},
++      },
+   };
+   const wgpu::BindGroupLayoutDescriptor descriptor{
+       .label = label,
+@@ -230,7 +244,7 @@ Params make_params(wgpu::Extent3D sourceSize, Vec2<uint32_t> dstSize) noexcept {
+ }
+ 
+ bool ensure_slot(Slot& slot, uint32_t width, uint32_t height) {
+-  const uint64_t byteSize = static_cast<uint64_t>(width) * static_cast<uint64_t>(height) * sizeof(uint32_t);
++  const uint64_t byteSize = static_cast<uint64_t>(width) * static_cast<uint64_t>(height) * sizeof(uint32_t) * 2;
+   if (slot.storageBuffer && slot.width == width && slot.height == height && slot.byteSize == byteSize) {
+     return true;
+   }
+@@ -291,11 +305,16 @@ void complete_slot(size_t slotIdx, wgpu::MapAsyncStatus status, wgpu::StringView
+   if (status == wgpu::MapAsyncStatus::Success) {
+     const auto valueCount = static_cast<size_t>(slot.width) * static_cast<size_t>(slot.height);
+     const auto* mapped =
+-        static_cast<const uint32_t*>(slot.readbackBuffer.GetConstMappedRange(0, valueCount * sizeof(uint32_t)));
++        static_cast<const uint32_t*>(slot.readbackBuffer.GetConstMappedRange(0, valueCount * sizeof(uint32_t) * 2));
+     if (mapped != nullptr) {
+       g_latest.width = slot.width;
+       g_latest.height = slot.height;
+-      g_latest.data.assign(mapped, mapped + valueCount);
++      g_latest.data.resize(valueCount);
++      g_latest.colors.resize(valueCount);
++      for (size_t i = 0; i < valueCount; ++i) {
++        g_latest.data[i] = mapped[i * 2];
++        g_latest.colors[i] = mapped[i * 2 + 1];
++      }
+     }
+     slot.readbackBuffer.Unmap();
+   } else if (status != wgpu::MapAsyncStatus::CallbackCancelled && status != wgpu::MapAsyncStatus::Aborted) {
+@@ -311,6 +330,8 @@ void initialize() {
+   }
+   g_bindGroupLayout = create_bind_group_layout("Depth Peek Bind Group Layout");
+   g_pipeline = create_pipeline(g_bindGroupLayout, "Depth Peek Pipeline");
++  g_bindGroupLayoutMS = create_bind_group_layout("Multisampled Depth Peek Layout",true);
++  g_pipelineMS = create_pipeline(g_bindGroupLayoutMS,"Multisampled Depth Peek Pipeline",true);
+   g_enabled = true;
+ }
+ 
+@@ -318,6 +339,8 @@ void shutdown() {
+   testing::reset();
+   g_pipeline = {};
+   g_bindGroupLayout = {};
++  g_pipelineMS = {};
++  g_bindGroupLayoutMS = {};
+   for (auto& slot : g_slots) {
+     slot = {};
+   }
+@@ -340,7 +363,14 @@ bool read_latest(uint16_t x, uint16_t y, uint32_t& z) noexcept {
+   return true;
+ }
+ 
+-void encode_frame_snapshot(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& depthView,
++bool read_latest_color(uint16_t x, uint16_t y, uint32_t& color) noexcept {
++  std::lock_guard lock{g_mutex};
++  if (x >= g_latest.width || y >= g_latest.height || g_latest.colors.empty()) return false;
++  color = g_latest.colors[static_cast<size_t>(y) * g_latest.width + x];
++  return true;
++}
++
++void encode_frame_snapshot(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& depthView, const wgpu::TextureView& colorView,
+                            wgpu::Extent3D sourceSize, uint32_t msaaSamples) noexcept {
+   if (!g_enabled) {
+     return;
+@@ -358,12 +388,12 @@ void encode_frame_snapshot(const wgpu::CommandEncoder& cmd, const wgpu::TextureV
+   }
+ 
+   const auto dstSize = vi::configured_fb_size();
+-  if (!depthView || dstSize.x == 0 || dstSize.y == 0 || sourceSize.width == 0 || sourceSize.height == 0) {
++  if (!depthView || !colorView || dstSize.x == 0 || dstSize.y == 0 || sourceSize.width == 0 || sourceSize.height == 0) {
+     return;
+   }
+-  if (msaaSamples > 1) {
+-    Log.fatal("Depth Peek from multisampled EFB targets is not supported");
+-  }
++  // Match the existing depth-copy path: sample zero supplies the original GX pixel depth.
++  const auto& layout=msaaSamples>1 ? g_bindGroupLayoutMS : g_bindGroupLayout;
++  const auto& pipeline=msaaSamples>1 ? g_pipelineMS : g_pipeline;
+ 
+   const Params params = make_params(sourceSize, dstSize);
+   wgpu::Buffer storageBuffer;
+@@ -401,10 +431,11 @@ void encode_frame_snapshot(const wgpu::CommandEncoder& cmd, const wgpu::TextureV
+           .buffer = paramsBuffer,
+           .size = sizeof(Params),
+       },
++      wgpu::BindGroupEntry{.binding = 3, .textureView = colorView},
+   };
+   const wgpu::BindGroupDescriptor bindGroupDescriptor{
+       .label = "Depth Peek Bind Group",
+-      .layout = g_bindGroupLayout,
++      .layout = layout,
+       .entryCount = bindGroupEntries.size(),
+       .entries = bindGroupEntries.data(),
+   };
+@@ -415,7 +446,7 @@ void encode_frame_snapshot(const wgpu::CommandEncoder& cmd, const wgpu::TextureV
+       .timestampWrites = webgpu::gpu_prof::pass_writes("Depth peek"),
+   };
+   const auto pass = cmd.BeginComputePass(&passDescriptor);
+-  pass.SetPipeline(g_pipeline);
++  pass.SetPipeline(pipeline);
+   pass.SetBindGroup(0, bindGroup);
+   pass.DispatchWorkgroups((dstSize.x + WorkgroupSizeX - 1) / WorkgroupSizeX,
+                           (dstSize.y + WorkgroupSizeY - 1) / WorkgroupSizeY);
+@@ -478,6 +509,13 @@ void set_latest(uint32_t width, uint32_t height, const std::vector<uint32_t>& da
+   g_latest.height = height;
+   g_latest.data = data;
+ }
++void set_latest_color(uint32_t width, uint32_t height, const std::vector<uint32_t>& data) {
++  std::lock_guard lock{g_mutex};
++  CHECK(data.size() == static_cast<size_t>(width) * height, "invalid color snapshot");
++  g_latest.width = width;
++  g_latest.height = height;
++  g_latest.colors = data;
++}
+ } // namespace testing
+ 
+ } // namespace aurora::gfx::depth_peek
+diff --git a/lib/gfx/depth_peek.hpp b/lib/gfx/depth_peek.hpp
+index 47e9a0a..c99fe73 100644
+--- a/lib/gfx/depth_peek.hpp
++++ b/lib/gfx/depth_peek.hpp
+@@ -11,8 +11,9 @@ void shutdown();
+ 
+ void request_snapshot() noexcept;
+ bool read_latest(uint16_t x, uint16_t y, uint32_t& z) noexcept;
++bool read_latest_color(uint16_t x, uint16_t y, uint32_t& color) noexcept;
+ 
+-void encode_frame_snapshot(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& depthView,
++void encode_frame_snapshot(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& depthView, const wgpu::TextureView& colorView,
+                            wgpu::Extent3D sourceSize, uint32_t msaaSamples) noexcept;
+ void after_submit() noexcept;
+ 
+@@ -20,6 +21,7 @@ namespace testing {
+ void reset() noexcept;
+ bool snapshot_requested() noexcept;
+ void set_latest(uint32_t width, uint32_t height, const std::vector<uint32_t>& data);
++void set_latest_color(uint32_t width, uint32_t height, const std::vector<uint32_t>& data);
+ } // namespace testing
+ 
+ } // namespace aurora::gfx::depth_peek
+diff --git a/lib/gfx/encoding.cpp b/lib/gfx/encoding.cpp
+index 2337784..cdc2479 100644
+--- a/lib/gfx/encoding.cpp
++++ b/lib/gfx/encoding.cpp
+@@ -250,7 +250,7 @@ void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo,
+   pass.End();
+ 
+   if (passInfo.captureDepthSnapshot) {
+-    depth_peek::encode_frame_snapshot(cmd, passInfo.copySourceDepthView,
++    depth_peek::encode_frame_snapshot(cmd, passInfo.copySourceDepthView, passInfo.copySourceView,
+                                       passInfo.colorAttachments[SceneColorAttachmentIndex].size, passInfo.msaaSamples);
+   }
+ 
+@@ -260,9 +260,6 @@ void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo,
+     const bool needsScaling = dstSize.width != static_cast<uint32_t>(passInfo.resolveRect.width) ||
+                               dstSize.height != static_cast<uint32_t>(passInfo.resolveRect.height);
+     const bool isDepth = gx::is_depth_format(passInfo.resolveFormat);
+-    if (isDepth && passInfo.msaaSamples > 1) {
+-      Log.fatal("Depth tex copies from multisampled EFB targets are not supported");
+-    }
+     const tex_copy_conv::ConvRequest convReq{
+         .fmt = passInfo.resolveFormat,
+         .srcFmt = passInfo.resolveSourceFormat,
+@@ -270,6 +267,7 @@ void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo,
+         .uniformRange = passInfo.resolveUniformRange,
+         .dst = passInfo.resolveTarget,
+         .sampleFilter = needsScaling ? tex_copy_conv::SampleFilter::Linear : tex_copy_conv::SampleFilter::Nearest,
++        .msaaSamples = passInfo.msaaSamples,
+     };
+     const bool needsOpaqueAlpha = !isDepth && !gx::efb_has_alpha(convReq.srcFmt);
+     const bool sameFormat =
+diff --git a/lib/gfx/frame.cpp b/lib/gfx/frame.cpp
+index e005a60..35500da 100644
+--- a/lib/gfx/frame.cpp
++++ b/lib/gfx/frame.cpp
+@@ -526,7 +526,7 @@ void initialize() {
+   initialize_pipeline_cache();
+ }
+ 
+-void shutdown() {
++void shutdown(bool preserveReplacements) {
+   render_worker::synchronize();
+   render_worker::shutdown();
+   g_processEventsQueued.store(false, std::memory_order_release);
+@@ -542,7 +542,7 @@ void shutdown() {
+   depth_peek::shutdown();
+   tex_copy_conv::shutdown();
+   tex_palette_conv::shutdown();
+-  texture_replacement::shutdown();
++  texture_replacement::shutdown(preserveReplacements);
+   gx::shutdown();
+ #ifdef AURORA_ENABLE_RMLUI
+   rmlui::shutdown_pipeline();
+diff --git a/lib/gfx/frame.hpp b/lib/gfx/frame.hpp
+index 0b86ffe..f19d3f0 100644
+--- a/lib/gfx/frame.hpp
++++ b/lib/gfx/frame.hpp
+@@ -32,7 +32,7 @@ std::optional<RegisteredEncoderTaskType> find_runtime_encoder_task_type(EncoderT
+ 
+ namespace aurora::gfx {
+ void initialize();
+-void shutdown();
++void shutdown(bool preserveReplacements = false);
+ bool begin_frame();
+ void end_frame(EndFrameCallback callback);
+ uint32_t current_frame() noexcept;
+diff --git a/lib/gfx/pipeline_cache.cpp b/lib/gfx/pipeline_cache.cpp
+index 4dc6337..1c0cf2d 100644
+--- a/lib/gfx/pipeline_cache.cpp
++++ b/lib/gfx/pipeline_cache.cpp
+@@ -1089,12 +1089,13 @@ static void stop_pipeline_cache_writer() {
+ 
+ PipelineRef find_pipeline(const clear::PipelineConfig& config, const RenderTargetLayout& layout) {
+   remember_pipeline_config(ShaderType::Clear, config, current_frame(), true);
+-  return resolve_pipeline(ShaderType::Clear, config, layout, PipelinePriority::Normal);
++  return resolve_pipeline(ShaderType::Clear, config, layout, PipelinePriority::Blocking);
+ }
+ 
+ PipelineRef find_pipeline(const gx::PipelineConfig& config, const RenderTargetLayout& layout) {
++  // Visible geometry must not disappear while its first shader compiles.
+   remember_pipeline_config(ShaderType::GX, config, current_frame(), true);
+-  return resolve_pipeline(ShaderType::GX, config, layout, PipelinePriority::Normal);
++  return resolve_pipeline(ShaderType::GX, config, layout, PipelinePriority::Blocking);
+ }
+ 
+ #ifdef AURORA_ENABLE_RMLUI
+diff --git a/lib/gfx/recording.cpp b/lib/gfx/recording.cpp
+index 9d1df79..af100d7 100644
+--- a/lib/gfx/recording.cpp
++++ b/lib/gfx/recording.cpp
+@@ -838,6 +838,8 @@ void resolve_pass_into(TextureHandle texture, ClipRect rect, bool clearColor, bo
+       .offset = {static_cast<float>(rect.x) / srcW, static_cast<float>(rect.y) / srcH},
+       .scale = {static_cast<float>(rect.width) / srcW, static_cast<float>(rect.height) / srcH},
+       .opaqueAlpha = !gx::efb_has_alpha(sourceFormat),
++      .clampTop = (gx::g_gxState.copyClamp & GX_CLAMP_TOP) ? (rect.y + 0.5f) / srcH : 0.f,
++      .clampBottom = (gx::g_gxState.copyClamp & GX_CLAMP_BOTTOM) ? (rect.y + rect.height - 0.5f) / srcH : 1.f,
+   };
+   prevPass.resolveUniformRange = push_uniform(uniforms);
+   enqueue_pass(current_frame_packet(), g_recorder.currentRenderPass);
+diff --git a/lib/gfx/tex_copy_conv.cpp b/lib/gfx/tex_copy_conv.cpp
+index 305d090..488f58c 100644
+--- a/lib/gfx/tex_copy_conv.cpp
++++ b/lib/gfx/tex_copy_conv.cpp
+@@ -28,6 +28,8 @@ struct Uniforms {
+     offset: vec2f,
+     scale: vec2f,
+     opaqueAlpha: u32,
++    clampTop: f32,
++    clampBottom: f32,
+ };
+ @group(0) @binding(2) var<uniform> ubuf: Uniforms;
+ 
+@@ -55,7 +57,7 @@ var<private> uvs: array<vec2f, 3> = array(
+ }
+ 
+ fn sample_efb(uv: vec2f) -> vec4f {
+-    let c = textureSample(src, src_samp, uv);
++    let c = textureSample(src, src_samp, vec2f(uv.x, clamp(uv.y, ubuf.clampTop, ubuf.clampBottom)));
+     return vec4f(c.rgb, select(c.a, 1.0, ubuf.opaqueAlpha != 0u));
+ }
+ 
+@@ -330,9 +332,11 @@ static constexpr std::array DepthConvPipelines{
+ 
+ static wgpu::BindGroupLayout g_bindGroupLayout;
+ static wgpu::BindGroupLayout g_depthBindGroupLayout;
++static wgpu::BindGroupLayout g_depthBindGroupLayoutMS;
+ static wgpu::Sampler g_nearestSampler;
+ static wgpu::Sampler g_linearSampler;
+ static absl::flat_hash_map<GXTexFmt, wgpu::RenderPipeline> g_pipelines;
++static absl::flat_hash_map<GXTexFmt, wgpu::RenderPipeline> g_depthPipelinesMS;
+ static wgpu::RenderPipeline g_blitPipeline;
+ static wgpu::BindGroupLayout g_depthSnapshotBindGroupLayout;
+ static wgpu::BindGroupLayout g_depthSnapshotBindGroupLayoutMS;
+@@ -515,6 +519,11 @@ void initialize() {
+       .entries = depthBindGroupLayoutEntries.data(),
+   };
+   g_depthBindGroupLayout = g_device.CreateBindGroupLayout(&depthBindGroupLayoutDescriptor);
++  auto depthMSLayoutEntries = depthBindGroupLayoutEntries;
++  depthMSLayoutEntries[0].texture.multisampled = true;
++  auto depthMSLayoutDescriptor = depthBindGroupLayoutDescriptor;
++  depthMSLayoutDescriptor.entries = depthMSLayoutEntries.data();
++  g_depthBindGroupLayoutMS = g_device.CreateBindGroupLayout(&depthMSLayoutDescriptor);
+ 
+   g_blitPipeline = create_pipeline(
+       {GX_TF_RGBA8, FragPassthrough, webgpu::g_graphicsConfig.surfaceConfiguration.format, "TexCopyConv Blit"},
+@@ -527,8 +536,13 @@ void initialize() {
+   }
+   // Skip depth copies in compatibility mode
+   if (webgpu::g_hasCoreFeatures) {
++    // Copy sample zero, matching the existing multisampled depth snapshots.
++    auto depthShaderMS = DepthShaderPreamble;
++    depthShaderMS.replace(depthShaderMS.find("texture_depth_2d"), std::string_view("texture_depth_2d").size(),
++                          "texture_depth_multisampled_2d");
+     for (const auto& conv : DepthConvPipelines) {
+       g_pipelines[conv.fmt] = create_pipeline(conv, DepthShaderPreamble, g_depthBindGroupLayout);
++      g_depthPipelinesMS[conv.fmt] = create_pipeline(conv, depthShaderMS, g_depthBindGroupLayoutMS);
+       if (conv.outputFormat != to_wgpu(conv.fmt)) {
+         Log.fatal("Output format mismatch for {}", conv.fmt);
+       }
+@@ -558,9 +572,11 @@ void initialize() {
+ 
+ void shutdown() {
+   g_pipelines.clear();
++  g_depthPipelinesMS.clear();
+   g_blitPipeline = {};
+   g_bindGroupLayout = {};
+   g_depthBindGroupLayout = {};
++  g_depthBindGroupLayoutMS = {};
+   g_nearestSampler = {};
+   g_linearSampler = {};
+   g_depthSnapshotBindGroupLayout = {};
+@@ -592,7 +608,7 @@ static void execute(const wgpu::CommandEncoder& cmd, const ConvRequest& req, con
+         },
+     };
+     const wgpu::BindGroupDescriptor bindGroupDescriptor{
+-        .layout = g_depthBindGroupLayout,
++        .layout = req.msaaSamples > 1 ? g_depthBindGroupLayoutMS : g_depthBindGroupLayout,
+         .entryCount = bindGroupEntries.size(),
+         .entries = bindGroupEntries.data(),
+     };
+@@ -645,8 +661,9 @@ static void execute(const wgpu::CommandEncoder& cmd, const ConvRequest& req, con
+ }
+ 
+ void run(const wgpu::CommandEncoder& cmd, const ConvRequest& req) {
+-  const auto it = g_pipelines.find(req.fmt);
+-  if (it == g_pipelines.end()) {
++  const auto& pipelines = gx::is_depth_format(req.fmt) && req.msaaSamples > 1 ? g_depthPipelinesMS : g_pipelines;
++  const auto it = pipelines.find(req.fmt);
++  if (it == pipelines.end()) {
+     Log.fatal("No copy conversion pipeline for format {}", static_cast<int>(req.fmt));
+   }
+   execute(cmd, req, it->second);
+diff --git a/lib/gfx/tex_copy_conv.hpp b/lib/gfx/tex_copy_conv.hpp
+index 9e6c9d2..e34b968 100644
+--- a/lib/gfx/tex_copy_conv.hpp
++++ b/lib/gfx/tex_copy_conv.hpp
+@@ -17,7 +17,9 @@ struct alignas(16) Uniforms {
+   Vec2<float> offset;
+   Vec2<float> scale{1.f, 1.f};
+   uint32_t opaqueAlpha = 0;
+-  std::array<uint32_t, 3> _pad{};
++  float clampTop = 0.f;
++  float clampBottom = 1.f;
++  uint32_t _pad = 0;
+ };
+ static_assert(sizeof(Uniforms) == 32);
+ 
+@@ -28,6 +30,7 @@ struct ConvRequest {
+   Range uniformRange;        // Uniforms
+   TextureHandle dst;         // Destination texture
+   SampleFilter sampleFilter = SampleFilter::Nearest;
++  uint32_t msaaSamples = 1;
+ };
+ 
+ bool needs_conversion(GXTexFmt fmt);
+diff --git a/lib/gfx/texture.cpp b/lib/gfx/texture.cpp
+index 029a3d0..5d0a1f2 100644
+--- a/lib/gfx/texture.cpp
++++ b/lib/gfx/texture.cpp
+@@ -22,6 +22,7 @@ using webgpu::g_device;
+ using webgpu::g_queue;
+ 
+ namespace {
++unsigned filteringOverride = 0;
+ constexpr Module Log{"aurora::gfx"};
+ 
+ wgpu::Extent3D physical_size(wgpu::Extent3D size, TextureFormatInfo info) {
+@@ -327,6 +328,11 @@ wgpu::SamplerDescriptor TextureBind::get_descriptor() const noexcept {
+     minFilter = wgpu::FilterMode::Linear;
+     mipFilter = wgpu::MipmapFilterMode::Linear;
+   }
++  if (filteringOverride) {
++    minFilter = magFilter = filteringOverride == 1 ? wgpu::FilterMode::Nearest : wgpu::FilterMode::Linear;
++    mipFilter = filteringOverride == 3 ? wgpu::MipmapFilterMode::Linear : wgpu::MipmapFilterMode::Nearest;
++    maxAnisotropy = 1;
++  }
+   return {
+       .label = "Generated Filtering Sampler",
+       .addressModeU = wgpu_address_mode(texObj.wrap_s()),
+@@ -341,3 +347,5 @@ wgpu::SamplerDescriptor TextureBind::get_descriptor() const noexcept {
+   };
+ }
+ } // namespace aurora::gfx
++
++extern "C" void AuroraSetTextureFiltering(unsigned mode) { if (mode <= 3) aurora::gfx::filteringOverride = mode; }
+diff --git a/lib/gfx/texture.hpp b/lib/gfx/texture.hpp
+index 600a430..64c0b20 100644
+--- a/lib/gfx/texture.hpp
++++ b/lib/gfx/texture.hpp
+@@ -91,7 +91,7 @@ struct GXTexObj_ {
+   GXTexWrapMode wrap_t() const noexcept { return static_cast<GXTexWrapMode>(get_bits(mode0, 2, 2)); }
+   GXTexFilter min_filter() const noexcept {
+     constexpr GXTexFilter kHwToGxFilter[8] = {
+-        GX_NEAR, GX_NEAR_MIP_NEAR, GX_LIN_MIP_NEAR, GX_NEAR, GX_LINEAR, GX_NEAR_MIP_LIN, GX_LIN_MIP_LIN, GX_NEAR,
++        GX_NEAR, GX_NEAR_MIP_NEAR, GX_NEAR_MIP_LIN, GX_NEAR, GX_LINEAR, GX_LIN_MIP_NEAR, GX_LIN_MIP_LIN, GX_NEAR,
+     };
+     return kHwToGxFilter[get_bits(mode0, 3, 5)];
+   }
+@@ -105,6 +105,8 @@ struct GXTexObj_ {
+   float min_lod() const noexcept { return static_cast<float>(get_bits(mode1, 8, 0)) / 16.0f; }
+   float max_lod() const noexcept { return static_cast<float>(get_bits(mode1, 8, 8)) / 16.0f; }
+ 
++  bool is_streaming() const noexcept { return (flags & 0x40) != 0; }
++
+   // Custom flag for texture caching
+   bool no_cache() const noexcept { return (flags & 0x80) != 0; }
+   void set_no_cache(bool value) noexcept { flags = value ? flags | 0x80 : flags & ~0x80; }
+diff --git a/lib/gfx/texture_convert.cpp b/lib/gfx/texture_convert.cpp
+index b2f791b..be9c5e9 100644
+--- a/lib/gfx/texture_convert.cpp
++++ b/lib/gfx/texture_convert.cpp
+@@ -574,6 +574,7 @@ static ByteBuffer BuildRGBA8FromBC1(uint32_t width, uint32_t height, uint32_t mi
+ 
+ ConvertedTexture convert_texture(u32 format, uint32_t width, uint32_t height, uint32_t mips, ArrayRef<uint8_t> data) {
+   ZoneScoped;
++  if (format == GX_TF_Z8 || format == GX_TF_Z16 || format == GX_TF_Z24X8) format &= 15u;
+   ByteBuffer converted;
+   switch (format) {
+     DEFAULT_FATAL("convert_texture: unknown texture format {}", format);
+diff --git a/lib/gfx/texture_replacement.cpp b/lib/gfx/texture_replacement.cpp
+index 03dda46..40b347b 100644
+--- a/lib/gfx/texture_replacement.cpp
++++ b/lib/gfx/texture_replacement.cpp
+@@ -1701,9 +1701,15 @@ bool has_replacement(const GXTexObj* obj, const GXTlutObj* tlut) {
+ namespace aurora::gfx::texture_replacement {
+ using namespace aurora::texture;
+ 
+-void shutdown() noexcept {
+-  clear_replacements();
++void shutdown(bool preserveRegistrations) noexcept {
+   stop_worker_pool();
++  if (!preserveRegistrations) { clear_replacements(); return; }
++  std::lock_guard lock{s_registryMutex};
++  s_cacheByKey.clear();
++  s_failedIds.clear();
++  s_reportedMisses.clear();
++  s_replacementLru.clear();
++  s_replacementCacheBytes = 0;
+ }
+ 
+ StreamingStats process_streaming() noexcept {
+diff --git a/lib/gfx/texture_replacement.hpp b/lib/gfx/texture_replacement.hpp
+index e99514d..a756df8 100644
+--- a/lib/gfx/texture_replacement.hpp
++++ b/lib/gfx/texture_replacement.hpp
+@@ -16,7 +16,7 @@ struct StreamingStats {
+   uint64_t publishBytes = 0;
+ };
+ 
+-void shutdown() noexcept;
++void shutdown(bool preserveRegistrations = false) noexcept;
+ StreamingStats process_streaming() noexcept;
+ std::optional<ReplacementResult> find_pointer_replacement(const GXTexObj_& obj) noexcept;
+ std::optional<ReplacementResult> find_source_replacement(const GXTexObj_& obj,
+diff --git a/lib/gx/command_processor.cpp b/lib/gx/command_processor.cpp
+index 9c6ffa1..4cdf06d 100644
+--- a/lib/gx/command_processor.cpp
++++ b/lib/gx/command_processor.cpp
+@@ -16,6 +16,8 @@
+ #include <algorithm>
+ #include <cmath>
+ #include <cstdint>
++#include <cstdio>
++#include <cstdlib>
+ #include <span>
+ #include <vector>
+ 
+@@ -231,6 +233,10 @@ ProcessResult process(const u8* data, u32 size) noexcept {
+       if (reg_get(value, 8, 24) == GX_BP_REG_DRAWDONE) {
+         return {static_cast<u32>(reader.offset()), true};
+       }
++      if (reg_get(value, 8, 24) == 0x48) {
++        return {static_cast<u32>(reader.offset()), false, true,
++                static_cast<u16>(g_gxState.bpRegCache[0x48])};
++      }
+       break;
+     }
+ 
+@@ -335,6 +341,13 @@ ProcessResult process(const u8* data, u32 size) noexcept {
+ }
+ 
+ [[noreturn]] static void handle_draw_overrun(size_t totalVtxBytes, const ByteReader& reader) noexcept {
++  if (const char* path = std::getenv("GALAXY_VERIFY_FIFO_DUMP")) {
++    if (auto* output = std::fopen(path, "wb")) {
++      const auto written = std::fwrite(reader.data(), 1, reader.size(), output);
++      std::fclose(output);
++      Log.error("Saved failing GX commands: {} bytes of {} to {}", written, reader.size(), path);
++    }
++  }
+   // Hex dump around the draw command for debugging
+   const size_t pos = reader.offset();
+   const size_t size = reader.size();
+@@ -383,7 +396,6 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
+                          u32 numIndices) noexcept {
+   auto& state = g_gxState;
+   auto& cache = sDrawCache;
+-
+   DrawImmediateData immediates{.vtxStart = vertRange.offset, .currentPnMtx = state.currentPnMtx};
+   for (int i = GX_VA_POS; i <= GX_VA_TEX7; ++i) {
+     if (state.vtxDesc[i] != GX_INDEX8 && state.vtxDesc[i] != GX_INDEX16) {
+@@ -619,11 +631,7 @@ void handle_aurora(ByteReader& reader) noexcept {
+     const auto newFormat = static_cast<GXTexFmt>(reader.read<u32>());
+     const auto newTlut = static_cast<GXTlut>(reader.read<u32>());
+     u8 newFlags = slot.flags & ~0x80u; // Reset no-cache flag
+-    if (reader.read<u8>() != 0) {
+-      newFlags |= 1u;
+-    } else {
+-      newFlags &= ~1u;
+-    }
++    newFlags = (newFlags & ~0x41u) | (reader.read<u8>() & 0x41u);
+     const u32 newTexObjId = reader.read<u32>();
+     const u32 newTexDataVersion = reader.read<u32>();
+     if (slot.data != newData || slot.mWidth != newWidth || slot.mHeight != newHeight ||
+diff --git a/lib/gx/command_processor.hpp b/lib/gx/command_processor.hpp
+index fb9fe15..39e0a29 100644
+--- a/lib/gx/command_processor.hpp
++++ b/lib/gx/command_processor.hpp
+@@ -9,6 +9,8 @@ namespace aurora::gx::fifo {
+ struct ProcessResult {
+   uint32_t bytesProcessed;
+   bool drawDone;
++  bool drawSync = false;
++  uint16_t token = 0;
+ };
+ 
+ // Process GX FIFO commands until the next draw done event or end of buffer
+diff --git a/lib/gx/fifo.cpp b/lib/gx/fifo.cpp
+index bcaba60..f10d06b 100644
+--- a/lib/gx/fifo.cpp
++++ b/lib/gx/fifo.cpp
+@@ -1,4 +1,5 @@
+ #include "fifo.hpp"
++#include "../host_memory.hpp"
+ 
+ #include "../thread.hpp"
+ #include "command_processor.hpp"
+@@ -6,8 +7,11 @@
+ #include <algorithm>
+ #include <atomic>
+ #include <cstring>
++#include <cstdlib>
++#include <thread>
+ #include <limits>
+ #include <mutex>
++#include <vector>
+ 
+ #include <tracy/Tracy.hpp>
+ 
+@@ -20,11 +24,19 @@ bool sInDisplayList = false;
+ uint8_t* sDlBuffer = nullptr;
+ uint32_t sDlSize = 0;
+ uint32_t sDlWritePos = 0;
++bool sVerifyWriter = false;
++std::thread::id sLiveWriter, sDisplayWriter;
++void verify_writer() {
++  constexpr Module Log{"aurora::gx::fifo"};
++  AURORA_ASSERT(std::this_thread::get_id() == (sInDisplayList ? sDisplayWriter : sLiveWriter),
++                "GX commands written from another thread while recording={}", sInDisplayList);
++}
+ } // namespace detail
+ 
+ namespace {
+ constexpr Module Log{"aurora::gx::fifo"};
+-constexpr auto kProcessingMode = ProcessingMode::Thread;
++// Avoid waking and synchronizing another CPU worker for every display list.
++constexpr auto kProcessingMode = ProcessingMode::Inline;
+ constexpr uint32_t kDrawBatchSize = 1;
+ 
+ bool sFrameActive = false;
+@@ -36,6 +48,10 @@ std::mutex sBufferMutex;
+ std::atomic<uint32_t> sWorkerWake{0};
+ thread::Thread sWorkerThread;
+ std::atomic<DrawDoneCallback> sDrawDoneCallback{nullptr};
++std::atomic<DrawSyncCallback> sDrawSyncCallback{nullptr};
++std::atomic<uint16_t> sDrawSyncToken{0};
++std::mutex sDrawSyncMutex;
++std::vector<uint16_t> sDrawSyncEvents;
+ 
+ void dispatch_draw_done() noexcept {
+   if (const auto callback = sDrawDoneCallback.load(std::memory_order_acquire); callback != nullptr) {
+@@ -49,6 +65,7 @@ void wake_worker() noexcept {
+ }
+ 
+ void process_to(uint64_t target, std::memory_order order) noexcept {
++  aurora::HostMemoryScope hostScope;
+   uint64_t processed = sProcessed.load(std::memory_order_relaxed);
+   while (processed < target) {
+     ProcessResult result{};
+@@ -67,6 +84,11 @@ void process_to(uint64_t target, std::memory_order order) noexcept {
+     if (result.drawDone) {
+       dispatch_draw_done();
+     }
++    if (result.drawSync) {
++      sDrawSyncToken.store(result.token, std::memory_order_release);
++      std::lock_guard lock{sDrawSyncMutex};
++      if (sDrawSyncCallback.load(std::memory_order_acquire)) sDrawSyncEvents.push_back(result.token);
++    }
+     processed += result.bytesProcessed;
+     sProcessed.store(processed, order);
+     sProcessed.notify_all();
+@@ -114,6 +136,8 @@ void stop_worker() {
+ ProcessingMode processing_mode() noexcept { return kProcessingMode; }
+ 
+ void init() {
++  detail::sVerifyWriter = std::getenv("GALAXY_VERIFY_FIFO_DUMP") != nullptr;
++  detail::sLiveWriter = std::this_thread::get_id();
+   stop_worker();
+ 
+   constexpr uint32_t initialCapacity = 64 * 1024;
+@@ -130,6 +154,8 @@ void init() {
+   sFrameActive = false;
+   sPendingDraws = 0;
+   sStreamBase = 0;
++  sDrawSyncToken.store(0, std::memory_order_relaxed);
++  { std::lock_guard lock{sDrawSyncMutex}; sDrawSyncEvents.clear(); }
+   sPublished.store(0, std::memory_order_relaxed);
+   sProcessed.store(0, std::memory_order_relaxed);
+   sWorkerWake.store(0, std::memory_order_relaxed);
+@@ -190,6 +216,20 @@ DrawDoneCallback set_draw_done_callback(DrawDoneCallback callback) noexcept {
+   return sDrawDoneCallback.exchange(callback, std::memory_order_acq_rel);
+ }
+ 
++DrawSyncCallback set_draw_sync_callback(DrawSyncCallback callback) noexcept {
++  std::lock_guard lock{sDrawSyncMutex};
++  sDrawSyncEvents.clear();
++  return sDrawSyncCallback.exchange(callback, std::memory_order_acq_rel);
++}
++uint16_t read_draw_sync() noexcept { return sDrawSyncToken.load(std::memory_order_acquire); }
++void dispatch_draw_sync() {
++  std::vector<uint16_t> events;
++  { std::lock_guard lock{sDrawSyncMutex}; events.swap(sDrawSyncEvents); }
++  for (auto token : events) {
++    if (auto callback = sDrawSyncCallback.load(std::memory_order_acquire)) callback(token);
++  }
++}
++
+ void finish_draw() noexcept {
+   if (!sFrameActive || kProcessingMode == ProcessingMode::Drain || detail::sInDisplayList) {
+     return;
+@@ -210,6 +250,7 @@ void patch_u32(uint32_t offset, uint32_t val) {
+ }
+ 
+ void begin_display_list(uint8_t* buf, uint32_t size) {
++  detail::sDisplayWriter = std::this_thread::get_id();
+   detail::sInDisplayList = true;
+   detail::sDlBuffer = buf;
+   detail::sDlSize = size;
+@@ -282,3 +323,5 @@ void clear_buffer() {
+ }
+ 
+ } // namespace aurora::gx::fifo
++
++extern "C" bool AuroraUsesHostMemory() { return aurora::hostMemory; }
+diff --git a/lib/gx/fifo.hpp b/lib/gx/fifo.hpp
+index 0d6a5d8..cda912e 100644
+--- a/lib/gx/fifo.hpp
++++ b/lib/gx/fifo.hpp
+@@ -14,6 +14,8 @@ extern bool sInDisplayList;
+ extern uint8_t* sDlBuffer;
+ extern uint32_t sDlSize;
+ extern uint32_t sDlWritePos;
++extern bool sVerifyWriter;
++void verify_writer();
+ } // namespace detail
+ 
+ enum class ProcessingMode : uint8_t {
+@@ -36,6 +38,7 @@ void end_frame() noexcept;
+ void write_data_grow(const void* data, uint32_t length);
+ 
+ inline void write_data(const void* data, const uint32_t length) {
++  if (detail::sVerifyWriter) detail::verify_writer();
+   if (!detail::sInDisplayList)
+     LIKELY {
+       if (length <= detail::sBufferCapacity - detail::sBufferSize)
+@@ -53,6 +56,7 @@ inline void write_data(const void* data, const uint32_t length) {
+ }
+ 
+ inline void write_u8(const uint8_t val) {
++  if (detail::sVerifyWriter) detail::verify_writer();
+   if (!detail::sInDisplayList)
+     LIKELY {
+       if (detail::sBufferSize < detail::sBufferCapacity)
+@@ -98,6 +102,11 @@ void publish() noexcept;
+ 
+ using DrawDoneCallback = void (*)();
+ DrawDoneCallback set_draw_done_callback(DrawDoneCallback callback) noexcept;
++using DrawSyncCallback = void (*)(uint16_t);
++DrawSyncCallback set_draw_sync_callback(DrawSyncCallback callback) noexcept;
++uint16_t read_draw_sync() noexcept;
++// Run callbacks on the command producer after draining, rather than on the FIFO worker.
++void dispatch_draw_sync();
+ 
+ // Display list recording
+ void begin_display_list(uint8_t* buf, uint32_t size);
+diff --git a/lib/gx/gx.cpp b/lib/gx/gx.cpp
+index 1fec701..d8f0bd7 100644
+--- a/lib/gx/gx.cpp
++++ b/lib/gx/gx.cpp
+@@ -302,21 +302,44 @@ void set_logical_viewport(const gfx::Viewport& viewport) noexcept {
+     g_gxState.dirty |= DirtyUniform;
+   }
+   g_gxState.logicalViewport = viewport;
+-  set_render_viewport(map_logical_viewport(viewport));
++  auto shifted = viewport;
++  const auto wrap = [](s32 coordinate) { return (coordinate % 2048 + 2048) % 2048; };
++  if (g_gxState.scissorOffsetX || g_gxState.scissorOffsetY) {
++    shifted.left += wrap(g_gxState.logicalScissor.x - g_gxState.scissorOffsetX) - g_gxState.logicalScissor.x;
++    shifted.top += wrap(g_gxState.logicalScissor.y - g_gxState.scissorOffsetY) - g_gxState.logicalScissor.y;
++  }
++  set_render_viewport(map_logical_viewport(shifted));
+ }
+ 
+ void set_render_viewport(const gfx::Viewport& viewport) noexcept {
+-  if (viewport.left != g_gxState.renderViewport.left || viewport.width != g_gxState.renderViewport.width ||
++  if (viewport != g_gxState.renderViewport || viewport.width != g_gxState.renderViewport.width ||
+       viewport.height != g_gxState.renderViewport.height) {
+     g_gxState.dirty |= DirtyUniform;
+   }
++  const auto needsDepthRange = [](const gfx::Viewport& vp) { return vp.znear < 0.f || vp.zfar > 1.f; };
++  if (needsDepthRange(viewport) != needsDepthRange(g_gxState.renderViewport)) g_gxState.dirty |= DirtyPipeline;
+   g_gxState.renderViewport = viewport;
+-  gfx::set_viewport(viewport);
++  auto actual = viewport;
++  if (g_gxState.scissorOffsetX || g_gxState.scissorOffsetY) {
++    const auto [width, height] = gfx::get_render_target_size();
++    actual.left = actual.top = 0.f;
++    actual.width = width; actual.height = height;
++  }
++  if (actual.znear < 0.f || actual.zfar > 1.f) { actual.znear = 0.f; actual.zfar = 1.f; }
++  gfx::set_viewport(actual);
+ }
+ 
+ void set_logical_scissor(const gfx::ClipRect& scissor) noexcept {
+   g_gxState.logicalScissor = scissor;
+-  set_render_scissor(map_logical_scissor(g_gxState.logicalScissor));
++  auto shifted = scissor;
++  if (g_gxState.scissorOffsetX || g_gxState.scissorOffsetY) {
++    shifted.x = ((scissor.x - g_gxState.scissorOffsetX) % 2048 + 2048) % 2048;
++    shifted.y = ((scissor.y - g_gxState.scissorOffsetY) % 2048 + 2048) % 2048;
++    // shortcut: this game uses a single wrapped scissor interval, split draws if a future caller crosses 2048.
++    CHECK(shifted.x + scissor.width <= 2048 && shifted.y + scissor.height <= 2048, "split wrapped scissor unsupported");
++  }
++  set_render_scissor(map_logical_scissor(shifted));
++  set_logical_viewport(g_gxState.logicalViewport);
+ }
+ 
+ void set_render_scissor(const gfx::ClipRect& scissor) noexcept {
+@@ -384,7 +407,10 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXV
+ 
+   const auto& vtxFmt = g_gxState.vtxFmts[fmt];
+   config.shaderConfig = {};
++  config.shaderConfig.depthRange = g_gxState.renderViewport.znear < 0.f || g_gxState.renderViewport.zfar > 1.f;
+   config.shaderConfig.fogType = g_gxState.fog.type;
++  config.shaderConfig.zTexture = g_gxState.zTexture | (g_gxState.zCompLocBeforeTex ? 16u : 0u);
++  config.shaderConfig.zTextureBias = g_gxState.zTextureBias;
+   config.shaderConfig.fogRangeEnabled = g_gxState.fog.rangeEnabled;
+   u8 vtxOffset = 0;
+   for (int i = GX_VA_PNMTXIDX; i <= GX_VA_TEX7; ++i) {
+@@ -611,6 +637,11 @@ void initialize() noexcept {
+ void shutdown() noexcept {
+   // TODO we should probably store this all in g_state.gx instead
+   sSamplerBindGroupLayout = {};
++  sEmptySampler = {};
++  sEmptyTexture = {};
++  sEmptyTextureView = {};
++  sPipelineLayout = {};
++  g_emptyTextureBindGroup = {};
+   sTextureBindGroupLayout = {};
+   {
+     std::lock_guard lock{sBindGroupLayoutMutex};
+@@ -622,6 +653,7 @@ void shutdown() noexcept {
+   }
+   g_gxState.loadedTextures.fill({});
+   g_gxState.loadedTluts.fill({});
++  g_gxState.dirty = DirtyAll;
+   clear_copy_texture_cache();
+   texture::shutdown();
+ }
+diff --git a/lib/gx/gx.hpp b/lib/gx/gx.hpp
+index 9e85609..6adb539 100644
+--- a/lib/gx/gx.hpp
++++ b/lib/gx/gx.hpp
+@@ -351,6 +351,8 @@ struct GXState {
+   GXPixelFmt pixelFmt = GX_PF_RGB8_Z24;
+   GXZFmt16 zFmt = GX_ZC_LINEAR;
+   bool zCompLocBeforeTex = false;
++  u32 zTextureBias = 0;
++  u8 zTexture = 0;
+   u32 dstAlpha; // u8; UINT32_MAX = disabled
+   AlphaCompare alphaCompare;
+   std::array<Vec4<float>, MaxTevRegs> colorRegs;
+@@ -360,7 +362,8 @@ struct GXState {
+   std::array<Light, GX::MaxLights> lights;
+   std::array<TevStage, MaxTevStages> tevStages;
+   std::array<GXTexObj_, MaxTextures> loadedTextures;
+-  std::array<GXTlutObj_, MaxTluts> loadedTluts;
++  std::array<GXTlutObj_, MaxTluts + MaxTextures> loadedTluts;
++  std::array<GXTlutObj_, 1024> gdTluts;
+   std::array<Mat3x4<float>, MaxTexMtx> texMtxs;
+   std::array<Mat3x4<float>, MaxPTTexMtx> ptTexMtxs;
+   std::array<TcgConfig, MaxTexCoord> tcgs;
+@@ -396,10 +399,12 @@ struct GXState {
+   AuroraViewportPolicy viewportPolicy = AURORA_VIEWPORT_FIT;
+   gfx::Viewport logicalViewport{0.f, 0.f, 640.f, 480.f, 0.f, 1.f};
+   gfx::Viewport renderViewport{0.f, 0.f, 640.f, 480.f, 0.f, 1.f};
++  s32 scissorOffsetX = 0, scissorOffsetY = 0;
+   gfx::ClipRect logicalScissor{0, 0, 640, 480};
+   gfx::ClipRect renderScissor{0, 0, 640, 480};
+ 
+   // EFB copy state
++  GXFBClamp copyClamp = GX_CLAMP_NONE;
+   gfx::ClipRect texCopySrc;
+   GXTexFmt texCopyFmt;
+   u32 texCopyDstWidth = 0;
+@@ -494,8 +499,9 @@ struct ShaderConfig {
+   u8 vtxStride = 0;
+   u8 lineMode : 2 = 0; // 1 = GX_LINES, 2 = GX_LINESTRIP, 3 = GX_POINTS
+   u8 fogRangeEnabled : 1 = false;
+-  u8 pad1 : 5 = 0;
+-  u8 pad2 = 0;
++  u8 depthRange : 1 = false;
++  u8 pad1 : 4 = 0;
++  u8 zTexture = 0; // format: bits 0-1, operation: bits 2-3, early depth test: bit 4
+   std::array<AttrConfig, MaxVtxAttr> attrs;
+   std::array<TevSwap, MaxTevSwap> tevSwapTable;
+   std::array<TevStage, MaxTevStages> tevStages;
+@@ -505,6 +511,7 @@ struct ShaderConfig {
+   AlphaCompare alphaCompare;
+   std::array<IndStage, MaxIndStages> indStages{};
+   u32 numIndStages = 0;
++  u32 zTextureBias = 0;
+ 
+   bool operator==(const ShaderConfig& rhs) const { return memcmp(this, &rhs, sizeof(*this)) == 0; }
+ };
+@@ -530,6 +537,7 @@ struct ShaderInfo {
+   std::bitset<MaxTextures> sampledIndTextures;
+   std::bitset<MaxIndTexMtxs> usedIndTexMtxs;
+   u32 uniformSize = 0;
++  bool depthRange : 1 = false;
+   bool usesFog : 1 = false;
+   bool lightingEnabled : 1 = false;
+   u8 lineMode : 2 = 0;
+diff --git a/lib/gx/pipeline.hpp b/lib/gx/pipeline.hpp
+index 54456ed..6ec3512 100644
+--- a/lib/gx/pipeline.hpp
++++ b/lib/gx/pipeline.hpp
+@@ -17,7 +17,7 @@ struct DrawData {
+   uint32_t dstAlpha;
+ };
+ 
+-constexpr uint32_t GXPipelineConfigVersion = 13;
++constexpr uint32_t GXPipelineConfigVersion = 15;
+ struct PipelineConfig {
+   uint32_t version = GXPipelineConfigVersion;
+   uint32_t msaaSamples = 1; // deprecated
+diff --git a/lib/gx/regs.cpp b/lib/gx/regs.cpp
+index dcec16d..25dfc31 100644
+--- a/lib/gx/regs.cpp
++++ b/lib/gx/regs.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include "gx_fmt.hpp"
+ #include "texture.hpp"
++#include <dolphin/gx/GXAurora.h>
+ 
+ #include <bit>
+ #include <cmath>
+@@ -142,6 +143,13 @@ void bp_scissor(u8, u32) noexcept {
+   set_logical_scissor({lf, tp, wd, ht});
+ }
+ 
++void bp_scissor_offset(u8, u32 value) noexcept {
++  g_gxState.scissorOffsetX = static_cast<s32>(reg_get(value, 10, 0)) * 2 - 342;
++  g_gxState.scissorOffsetY = static_cast<s32>(reg_get(value, 10, 10)) * 2 - 342;
++  bp_scissor(0, 0);
++  set_logical_viewport(g_gxState.logicalViewport);
++}
++
+ // Line/point size (0x22)
+ void bp_line_point_size(u8, u32 value) noexcept {
+   g_gxState.lineWidth = static_cast<u8>(reg_get(value, 8, 0));
+@@ -267,9 +275,12 @@ void bp_clear_bg(u8, u32 value) noexcept {
+ }
+ 
+ void bp_clear_depth(u8, u32 value) noexcept { g_gxState.clearDepth = reg_get(value, 24, 0); }
++void bp_z_texture_bias(u8, u32 value) noexcept { g_gxState.zTextureBias = value & 0xFFFFFFu; }
++void bp_z_texture(u8, u32 value) noexcept { g_gxState.zTexture = value & 15u; }
+ 
+ // EFB copy trigger (0x52)
+ void bp_efb_copy(u8, u32 value) noexcept {
++  g_gxState.copyClamp = static_cast<GXFBClamp>(value & 3u);
+   const bool clear = reg_get(value, 1, 11) != 0;
+   if (reg_get(value, 1, 14) != 0) {
+     Log.warn("STUB: display copy is not implemented");
+@@ -281,7 +292,16 @@ void bp_efb_copy(u8, u32 value) noexcept {
+ // TLUT load trigger (0x65)
+ void bp_tlut_load(u8, u32 value) noexcept {
+   const auto idx = reg_get(value, 10, 0);
+-  if (idx < MaxTluts) {
++  const auto address = reg_get(g_gxState.bpRegCache[0x64], 24, 0);
++  if (address & 0x800000) {
++    auto& slot = g_gxState.gdTluts[idx];
++    const auto blocks = reg_get(value, 11, 10);
++    AURORA_ASSERT(blocks > 0 && blocks <= 1024, "Invalid GD palette block count {}", blocks);
++    slot.data = AuroraResolveTexturePointer(address);
++    slot.numEntries = static_cast<u16>(blocks * 16);
++    slot.tlutObjId = slot.tlutDataVersion = 0;
++    texture::invalidate_bindings();
++  } else if (idx < MaxTluts) {
+     auto& slot = g_gxState.loadedTluts[idx];
+     slot.loadTlut0 = g_gxState.bpRegCache[0x64];
+     slot.numEntries = static_cast<u16>(reg_get(value, 10, 10) + 1);
+@@ -481,6 +501,10 @@ void bp_tex(u8 reg, u32 value) noexcept {
+   switch (kind) {
+   case 0: // Mode0
+     slot.mode0 = value;
++    if (slot.texObjId == 0) {
++      const auto filter = reg_get(value, 3, 5);
++      slot.flags = (slot.flags & ~1u) | (filter != 0 && filter != 4 ? 1u : 0u);
++    }
+     break;
+   case 1: // Mode1
+     slot.mode1 = value;
+@@ -493,7 +517,23 @@ void bp_tex(u8 reg, u32 value) noexcept {
+     break;
+   case 5: // Image3
+     slot.image3 = value;
++    slot.data = AuroraResolveTexturePointer(reg_get(value, 24, 0));
++    slot.texObjId = slot.texDataVersion = 0;
++    {
++      const auto filter = reg_get(slot.mode0, 3, 5);
++      // Display-list model textures must not inherit the previous movie plane's streaming flag.
++      slot.flags = (slot.flags & ~0x41u) | (filter != 0 && filter != 4 ? 1u : 0u);
++    }
++    break;
++  case 6: { // TLUT TMEM address and format
++    if (!(slot.image3 & 0x800000)) break; // GX objects supply their own palette metadata.
++    const auto index = reg_get(value, 10, 0);
++    slot.tlut = static_cast<GXTlut>(MaxTluts + texMapId);
++    auto& palette = g_gxState.loadedTluts[MaxTluts + texMapId];
++    palette = g_gxState.gdTluts[index];
++    palette.format = static_cast<GXTlutFmt>(reg_get(value, 2, 10));
+     break;
++  }
+   default:
+     break;
+   }
+@@ -523,6 +563,7 @@ constexpr auto kBpRegs = [] {
+   }
+   regs[0x20] = {bp_scissor};
+   regs[0x21] = {bp_scissor};
++  regs[0x59] = {bp_scissor_offset, DirtyUniform};
+   regs[0x22] = {bp_line_point_size, DirtyUniform};
+   regs[0x25] = {bp_ind_scale, DirtyPipeline};
+   regs[0x26] = {bp_ind_scale, DirtyPipeline};
+@@ -550,8 +591,8 @@ constexpr auto kBpRegs = [] {
+       regs[base + 0x08 + i] = {bp_tex, DirtyTextures}; // Image0
+       regs[base + 0x0C + i] = {};                      // Image1 (GXTexRegion)
+       regs[base + 0x10 + i] = {};                      // Image2 (GXTexRegion)
+-      regs[base + 0x14 + i] = {bp_tex, DirtyTextures}; // Image3
+-      regs[base + 0x18 + i] = {};                      // TLUT region TMEM offset
++      regs[base + 0x14 + i] = {bp_tex, DirtyTextures, true}; // Image3, repeated data can change
++      regs[base + 0x18 + i] = {bp_tex, DirtyTextures, true}; // TLUT region TMEM offset
+     }
+   }
+   for (u8 r = 0xC0; r <= 0xDE; r += 2) {
+@@ -571,6 +612,8 @@ constexpr auto kBpRegs = [] {
+   regs[0xF1] = {bp_fog3, DirtyPipeline | DirtyUniform}; // fog.type affects shader
+   regs[0xF2] = {bp_fog_color, DirtyUniform};
+   regs[0xF3] = {bp_alpha_compare, DirtyPipeline};
++  regs[0xF4] = {bp_z_texture_bias, DirtyPipeline};
++  regs[0xF5] = {bp_z_texture, DirtyPipeline};
+   for (u8 r = 0xF6; r <= 0xFD; ++r) {
+     regs[r] = {bp_ksel, DirtyPipeline};
+   }
+diff --git a/lib/gx/shader.cpp b/lib/gx/shader.cpp
+index 9dfbdac..cd0b06c 100644
+--- a/lib/gx/shader.cpp
++++ b/lib/gx/shader.cpp
+@@ -1072,6 +1072,7 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
+   }
+ 
+   uniBufAttrs += "\n    proj: mat4x4f,";
++  if (config.depthRange) uniBufAttrs += "\n    depth_range: vec4f,";
+   uniBufAttrs += fmt::format("\n    postex_mtx: array<mat3x4f, {}>,", MaxPnMtx + MaxTexMtx);
+   uniBufAttrs += fmt::format("\n    nrm_mtx: array<mat3x4f, {}>,", MaxPnMtx);
+   std::string fragmentFnPre;
+@@ -1233,7 +1234,10 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
+       fragmentFnPre += fmt::format("\n    var tex{0}_uv = in.tex{0}_uv.xy;", i);
+       continue;
+     }
+-    if (tcg.src >= GX_TG_TEX0 && tcg.src <= GX_TG_TEX7) {
++    if (tcg.src == GX_MAX_TEXGENSRC) {
++      // Disabled generators can still be referenced by TEV; they have no vertex input.
++      vtxXfrAttrs += fmt::format("\n    var tc{} = vec4f(0.0, 0.0, 1.0, 1.0);", i);
++    } else if (tcg.src >= GX_TG_TEX0 && tcg.src <= GX_TG_TEX7) {
+       vtxXfrAttrs += fmt::format("\n    var tc{} = vec4f({}, 1.0, 1.0);", i,
+                                  vtx_attr(config, GXAttr(GX_VA_TEX0 + (tcg.src - GX_TG_TEX0))));
+     } else if (tcg.src == GX_TG_POS) {
+@@ -1354,7 +1358,7 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
+     const bool hasIndirectStage = stage.indTexStage < config.numIndStages;
+     const bool needsTevTexCoord =
+         needsIndirectCoord || stage.indTexWrapS != GX_ITW_OFF || stage.indTexWrapT != GX_ITW_OFF || stage.indTexAddPrev;
+-    const bool needsTextureSample = uses_texture_sample(stage);
++    const bool needsTextureSample = uses_texture_sample(stage) || ((config.zTexture & 12u) && i == config.tevStageCount - 1);
+     if (!needsTevTexCoord && !needsTextureSample) {
+       continue;
+     }
+@@ -1524,6 +1528,14 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
+         fmt::format("\n    var sampled{0} = textureSampleBias(tex{1}, tex{1}_samp, {2}, ubuf.tex{1}_size_bias.z);", i,
+                     underlying(stage.texMapId), uvIn);
+   }
++  if (config.zTexture & 12u) {
++    fragmentFnPre += fmt::format("\n    let ztex_bytes = vec4u(round(clamp(sampled{}, vec4f(0.0), vec4f(1.0)) * 255.0));", config.tevStageCount - 1);
++    const auto type = config.zTexture & 3u;
++    const auto packed = type == 0 ? "ztex_bytes.a" : type == 1 ? "(ztex_bytes.a * 256u + ztex_bytes.r)" : "(ztex_bytes.r * 65536u + ztex_bytes.g * 256u + ztex_bytes.b)";
++    const auto originalDepth = UseReversedZ ? "(1.0 - in.pos.z)" : "in.pos.z";
++    fragmentFnPre += fmt::format("\n    let z_texture_depth = f32(({} + {}u {}) & 0xFFFFFFu) / 16777216.0;", packed, config.zTextureBias,
++      ((config.zTexture >> 2) & 3u) == GX_ZT_ADD ? fmt::format("+ u32(clamp({}, 0.0, 1.0) * 16777215.0)", originalDepth) : "");
++  }
+   if (info.usesPTTexMtx.any()) {
+     uniBufAttrs += fmt::format("\n    postmtx: array<mat3x4f, {}>,", MaxPTTexMtx);
+   }
+@@ -1540,7 +1552,7 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
+         "}";
+     uniBufAttrs += "\n    fog: Fog,";
+ 
+-    const std::string_view fogDepth = UseReversedZ ? "(1.0 - in.pos.z)" : "in.pos.z";
++    const std::string_view fogDepth = (config.zTexture & 12u) ? "z_texture_depth" : UseReversedZ ? "(1.0 - in.pos.z)" : "in.pos.z";
+     if ((config.fogType & 0x08) != 0) {
+       fragmentFn += fmt::format("\n    // Orthographic fog\n    var fogBase = ubuf.fog.a * {};", fogDepth);
+     } else {
+@@ -1672,6 +1684,20 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
+     fragmentReturn = "\n    return FragmentOutput(vec4f(prev.rgb, 1.0), prev);";
+   }
+ 
++  const bool textureDepth = (config.zTexture & 12u) && !(config.zTexture & 16u);
++  if (config.depthRange || textureDepth) {
++    if (fragmentOutput.empty()) {
++      fragmentOutput = "\nstruct FragmentOutput {\n    @location(0) color: vec4f,\n};\n";
++      fragmentOutputType = "FragmentOutput"sv;
++      fragmentReturn = "\n    var out: FragmentOutput;\n    out.color = prev;\n    return out;";
++    }
++    fragmentOutput.insert(fragmentOutput.find("};"), "    @builtin(frag_depth) depth: f32,\n");
++    if (dstAlphaMode == DstAlphaMode::DualSource) {
++      fragmentReturn = "\n    var out: FragmentOutput;\n    out.color = vec4f(prev.rgb, 1.0);\n    out.blend = prev;\n    return out;";
++    }
++    const auto pos = fragmentReturn.find("return out;");
++    fragmentReturn.insert(pos, textureDepth ? (UseReversedZ ? "out.depth = 1.0 - z_texture_depth;\n    " : "out.depth = z_texture_depth;\n    ") : "out.depth = clamp(in.pos.z * ubuf.depth_range.x + ubuf.depth_range.y, 0.0, 1.0);\n    ");
++  }
+   auto shaderSource =
+       fmt::format(R"""(
+ fn bswap32(v: u32, le: bool) -> u32 {{
+diff --git a/lib/gx/shader_info.cpp b/lib/gx/shader_info.cpp
+index c74bd6d..e690a6c 100644
+--- a/lib/gx/shader_info.cpp
++++ b/lib/gx/shader_info.cpp
+@@ -223,6 +223,13 @@ ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
+       .uniformSize = 8 + 8 + 64,
+   };
+ 
++  info.depthRange = config.depthRange;
++  if (config.zTexture & 12u) {
++    const auto& stage = config.tevStages[config.tevStageCount - 1];
++    CHECK(stage.texMapId != GX_TEXMAP_NULL && stage.texCoordId != GX_TEXCOORD_NULL, "depth texture requires a final texture stage");
++    info.sampledTextures.set(stage.texMapId); info.sampledTexCoords.set(stage.texCoordId);
++  }
++  if (config.depthRange) info.uniformSize += 16;
+   if (config.lineMode != 0) {
+     info.uniformSize += 4 + 4 + 4 + 4; // line_width, line_aspect_y, line_tex_offset, line_texcoord_mask
+     info.lineMode = config.lineMode;
+@@ -395,7 +402,22 @@ static void fill_uniform(ByteBuffer& buf, const ShaderInfo& info) noexcept {
+   } else {
+     proj.m2 = proj.m2 + proj.m3;
+   }
++  if (g_gxState.scissorOffsetX != 0 || g_gxState.scissorOffsetY != 0) {
++    const auto [width, height] = gfx::get_render_target_size();
++    const auto& vp = g_gxState.renderViewport;
++    const float sx = vp.width / width, sy = vp.height / height;
++    const float tx = (2.f * vp.left + vp.width) / width - 1.f;
++    const float ty = 1.f - (2.f * vp.top + vp.height) / height;
++    proj.m0 = proj.m0 * Vec4{sx, sx, sx, sx} + proj.m3 * Vec4{tx, tx, tx, tx};
++    proj.m1 = proj.m1 * Vec4{sy, sy, sy, sy} + proj.m3 * Vec4{ty, ty, ty, ty};
++  }
+   buf.append(proj);
++  if (info.depthRange) {
++    const auto& vp = g_gxState.renderViewport;
++    const float scale = vp.zfar - vp.znear;
++    const float offset = UseReversedZ ? 1.f - vp.zfar : vp.znear;
++    buf.append(Vec4{scale, offset, 0.f, 0.f});
++  }
+ 
+   for (int i = 0; i < MaxPnMtx; i++) {
+     buf.append(g_gxState.pnMtx[i].pos);
+diff --git a/lib/gx/texture.cpp b/lib/gx/texture.cpp
+index a56709a..969b84b 100644
+--- a/lib/gx/texture.cpp
++++ b/lib/gx/texture.cpp
+@@ -13,6 +13,10 @@
+ 
+ #include <algorithm>
+ #include <atomic>
++#include <bit>
++#include <chrono>
++#include <deque>
++#include <mutex>
+ #include <cstddef>
+ #include <cstdint>
+ #include <cstring>
+@@ -129,6 +133,11 @@ uint64_t s_bindGeneration = 1;
+ std::atomic<uint64_t> s_pendingInvalidations = 0;
+ std::atomic<uint64_t> s_pendingCacheClears = 0;
+ TextureStats s_stats;
++struct TexturePreload { TextureContentKey key; ByteBuffer bytes; };
++std::mutex s_preloadMutex;
++std::deque<TexturePreload> s_preloads;
++uint64_t s_preloadBytes = 0;
++constexpr uint64_t PreloadBudgetBytes = 32ull * 1024ull * 1024ull;
+ 
+ #if DEBUG
+ constexpr bool BuildSourceKeyForDebug = true;
+@@ -543,17 +552,20 @@ size_t texture_source_size(u32 format, u32 width, u32 height, u32 mipCount) noex
+       total += div_ceil(static_cast<u32>(mipWidth), 8) * div_ceil(static_cast<u32>(mipHeight), 8) * 32;
+       break;
+     case GX_TF_I8:
++    case GX_TF_Z8:
+     case GX_TF_IA4:
+     case GX_TF_C8:
+       total += div_ceil(static_cast<u32>(mipWidth), 8) * div_ceil(static_cast<u32>(mipHeight), 4) * 32;
+       break;
+     case GX_TF_IA8:
++    case GX_TF_Z16:
+     case GX_TF_RGB565:
+     case GX_TF_RGB5A3:
+     case GX_TF_C14X2:
+       total += div_ceil(static_cast<u32>(mipWidth), 4) * div_ceil(static_cast<u32>(mipHeight), 4) * 32;
+       break;
+     case GX_TF_RGBA8:
++    case GX_TF_Z24X8:
+       total += div_ceil(static_cast<u32>(mipWidth), 4) * div_ceil(static_cast<u32>(mipHeight), 4) * 64;
+       break;
+     default:
+@@ -606,6 +618,38 @@ gfx::TextureHandle resolve_static_texture(const GXTexObj_& obj) {
+     }
+   }
+ 
++  if (obj.is_streaming()) {
++    auto& entry = s_textureObjectCaches[obj.texObjId];
++    if (!entry.handle) {
++      const u32 format = obj.format() == GX_TF_I8 ? GX_TF_R8_PC : obj.format();
++      entry.handle = gfx::new_dynamic_texture_2d(obj.width(), obj.height(), obj.mip_count(), format, "GX Video Plane");
++      ++s_stats.misses;
++    }
++    const size_t bytes = texture_source_size(obj.format(), obj.width(), obj.height(), obj.mip_count());
++    const auto* source = static_cast<const uint8_t*>(obj.data);
++    if (obj.format() == GX_TF_I8) {
++      // Video planes stay single-channel instead of expanding every pixel into four copies.
++      CHECK(obj.mip_count() == 1, "streaming I8 textures must have one mip");
++      ByteBuffer linear{size_t(obj.width()) * obj.height()};
++      size_t offset = 0;
++      for (u32 y = 0; y < obj.height(); y += 4) {
++        for (u32 x = 0; x < obj.width(); x += 8, offset += 32) {
++          for (u32 row = 0; row < std::min(4u, obj.height()-y); ++row) {
++            std::memcpy(linear.data()+size_t(y+row)*obj.width()+x, source+offset+row*8,
++                        std::min(8u, obj.width()-x));
++          }
++        }
++      }
++      gfx::write_texture(*entry.handle, linear);
++    } else {
++      gfx::write_texture(*entry.handle, {source, bytes});
++    }
++    entry.texDataVersion = obj.texDataVersion;
++    entry.lastUsedFrame = s_frameCount;
++    s_stats.uploadBytes += texture_handle_size(entry.handle);
++    return entry.handle;
++  }
++
+   gfx::TextureHandle handle;
+   uint64_t replacementId = 0;
+   std::optional<TextureKeys> keys;
+@@ -698,6 +742,26 @@ gfx::TextureHandle resolve_static_palette_texture(const GXTexObj_& obj, const GX
+   return handle;
+ }
+ 
++void preload_frame() noexcept {
++  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(2);
++  do {
++    TexturePreload job;
++    {
++      std::lock_guard lock{s_preloadMutex};
++      if (s_preloads.empty()) break;
++      job = std::move(s_preloads.front()); s_preloads.pop_front();
++      s_preloadBytes -= job.bytes.size();
++    }
++    if (!find_content_texture(job.key)) {
++      auto handle = gfx::new_static_texture_2d(job.key.width, job.key.height, job.key.mipCount, job.key.format,
++                                               job.bytes, false, "GX Preloaded Texture");
++      ++s_stats.misses;
++      s_stats.uploadBytes += texture_handle_size(handle);
++      cache_content_texture(job.key, handle);
++    }
++  } while (std::chrono::steady_clock::now() < deadline);
++}
++
+ void end_frame() noexcept {
+   const auto streamingStats = gfx::texture_replacement::process_streaming();
+   s_stats.pendingLoads = streamingStats.pendingLoads;
+@@ -725,6 +789,9 @@ void end_frame() noexcept {
+ }
+ 
+ void shutdown() noexcept {
++  {
++    std::lock_guard lock{s_preloadMutex}; s_preloads.clear(); s_preloadBytes = 0;
++  }
+   s_textureObjectCaches.clear();
+   s_tlutObjectCaches.clear();
+   s_replacementUsers.clear();
+@@ -877,3 +944,27 @@ void resolve_sampled_textures(const ShaderInfo& info) noexcept {
+   }
+ }
+ } // namespace aurora::gx
++
++namespace aurora::texture {
++bool queue_texture_preload(RawTextureReplacement source) {
++  if (!source.width || !source.height || source.width>1024 || source.height>1024 ||
++      !source.mipCount || source.mipCount>std::bit_width(std::max(source.width,source.height)) ||
++      !(source.gxFormat<=6 || source.gxFormat==14)) return false;
++  const auto expected = gx::texture::texture_source_size(source.gxFormat,source.width,source.height,source.mipCount);
++  if (!source.bytes.data() || source.bytes.size()!=expected) return false;
++  const gx::TextureContentKey key{.textureHash=XXH3_128bits(source.bytes.data(),expected),
++      .width=source.width,.height=source.height,.format=source.gxFormat,.mipCount=source.mipCount};
++  std::lock_guard lock{gx::s_preloadMutex};
++  if (gx::s_preloadBytes + expected > gx::PreloadBudgetBytes) return false;
++  for (const auto& pending : gx::s_preloads) if (pending.key==key) return true;
++  ByteBuffer copy{expected};
++  if (!copy.data()) return false;
++  std::memcpy(copy.data(),source.bytes.data(),expected);
++  gx::s_preloadBytes += expected;
++  gx::s_preloads.push_back({key,std::move(copy)});
++  return true;
++}
++bool texture_preloads_pending() {
++  std::lock_guard lock{gx::s_preloadMutex}; return !gx::s_preloads.empty();
++}
++} // namespace aurora::texture
+diff --git a/lib/gx/texture.hpp b/lib/gx/texture.hpp
+index 29c9a48..dbd9cd2 100644
+--- a/lib/gx/texture.hpp
++++ b/lib/gx/texture.hpp
+@@ -36,6 +36,7 @@ size_t tlut_source_size(u16 numEntries) noexcept;
+ void invalidate_bindings() noexcept;
+ uint64_t current_bind_generation() noexcept;
+ void invalidate_replacement(uint64_t replacementId) noexcept;
++void preload_frame() noexcept;
+ void end_frame() noexcept;
+ void shutdown() noexcept;
+ void set_content_cache_budget_for_testing(uint64_t bytes) noexcept;
+diff --git a/lib/imgui.cpp b/lib/imgui.cpp
+index 77f65fd..8e85ca4 100644
+--- a/lib/imgui.cpp
++++ b/lib/imgui.cpp
+@@ -17,6 +17,7 @@
+ #include "input/router.hpp"
+ #include "webgpu/gpu.hpp"
+ #include "window.hpp"
++#include "dolphin/vi/vi_internal.hpp"
+ 
+ #define IMGUI_IMPL_WEBGPU_BACKEND_DAWN
+ #include "backends/imgui_impl_sdl3.h"
+@@ -85,6 +86,7 @@ input::EventResult input_layer_event(const input::InputEvent& event, void*) {
+     return input::EventResult::Pass;
+   }
+   ImGuiIO& io = ImGui::GetIO();
++  if(g_cursorManaged) io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
+   if (event.payload.is<input::InputEvent::Cancelled>()) {
+     if (kind == Kind::Keyboard) {
+       io.ClearInputKeys();
+@@ -243,6 +245,9 @@ void new_frame(const AuroraWindowSize& size) noexcept {
+ 
+ DrawData freeze() noexcept {
+   ZoneScoped;
++  if (vi::is_black()) {
++    ImGui::GetForegroundDrawList()->AddRectFilled({0, 0}, ImGui::GetIO().DisplaySize, IM_COL32(0, 0, 0, 255));
++  }
+   ImGui::Render();
+ 
+   auto* data = ImGui::GetDrawData();
+diff --git a/lib/io.cpp b/lib/io.cpp
+index 31749d7..caab370 100644
+--- a/lib/io.cpp
++++ b/lib/io.cpp
+@@ -4,6 +4,7 @@
+ #include <atomic>
+ #include <cstring>
+ #include <exception>
++#include <stdexcept>
+ #include <limits>
+ #include <system_error>
+ #include <utility>
+@@ -14,6 +15,7 @@ namespace aurora::io {
+ namespace {
+ 
+ std::atomic<uint64_t> s_temporaryFileCounter = 0;
++thread_local AtomicFileBatch* s_batch = nullptr;
+ 
+ void restore_error(const std::string& error) noexcept {
+   if (!error.empty()) {
+@@ -288,8 +290,47 @@ AtomicFileWriter open_atomic_file(const std::filesystem::path& path, AtomicFileM
+ }
+ 
+ bool write_file_atomic(const std::filesystem::path& path, std::span<const uint8_t> data) noexcept {
++  if (s_batch) {
++    try { return s_batch->stage(path, data); }
++    catch (const std::exception& error) { SDL_SetError("Cannot stage file: %s",error.what()); return false; }
++  }
+   auto writer = open_atomic_file(path);
+   return writer && write_exact(writer.get(), data.data(), data.size()) && writer.commit();
+ }
+ 
++AtomicFileBatch::AtomicFileBatch() { if (s_batch) throw std::logic_error("Nested file transaction"); s_batch = this; }
++AtomicFileBatch::~AtomicFileBatch() { if (s_batch == this) s_batch = nullptr; }
++bool AtomicFileBatch::stage(const std::filesystem::path& path, std::span<const uint8_t> data) {
++  for (auto& entry : entries) if (entry.path == path) { entry.data.assign(data.begin(), data.end()); return true; }
++  entries.push_back({path, {data.begin(), data.end()}}); return true;
++}
++bool AtomicFileBatch::commit() {
++  s_batch = nullptr;
++  std::vector<AtomicFileWriter> writers;
++  std::vector<std::optional<std::vector<uint8_t>>> previous;
++  for (const auto& entry : entries) {
++    std::error_code error;
++    const bool exists = std::filesystem::exists(entry.path, error);
++    if (error) return false;
++    previous.push_back(exists ? read_file(entry.path) : std::nullopt);
++    if (exists && !previous.back()) return false;
++    auto writer = open_atomic_file(entry.path);
++    if (!writer || !write_exact(writer.get(), entry.data.data(), entry.data.size())) return false;
++    writers.push_back(std::move(writer));
++  }
++  for (size_t i = 0; i < writers.size(); ++i) if (!writers[i].commit()) {
++    const std::string error = SDL_GetError();
++    for (size_t j = 0; j < i; ++j) {
++      if (previous[j]) {
++        if (!write_file_atomic(entries[j].path, *previous[j])) throw std::runtime_error("Cannot restore settings file after failed apply");
++      } else {
++        std::error_code removeError; std::filesystem::remove(entries[j].path, removeError);
++        if (removeError) throw std::runtime_error("Cannot remove settings file after failed apply");
++      }
++    }
++    restore_error(error); return false;
++  }
++  return true;
++}
++
+ } // namespace aurora::io
+diff --git a/lib/io.hpp b/lib/io.hpp
+index ab27ee4..0f9b962 100644
+--- a/lib/io.hpp
++++ b/lib/io.hpp
+@@ -76,4 +76,18 @@ AtomicFileWriter open_atomic_file(const std::filesystem::path& path,
+                                   AtomicFileMode mode = AtomicFileMode::Truncate) noexcept;
+ bool write_file_atomic(const std::filesystem::path& path, std::span<const uint8_t> data) noexcept;
+ 
++/** Stages this thread's atomic writes; a failed commit restores the previous files. */
++class AtomicFileBatch {
++public:
++  AtomicFileBatch();
++  ~AtomicFileBatch();
++  AtomicFileBatch(const AtomicFileBatch&) = delete;
++  AtomicFileBatch& operator=(const AtomicFileBatch&) = delete;
++  bool commit();
++  bool stage(const std::filesystem::path& path, std::span<const uint8_t> data);
++private:
++  struct Entry { std::filesystem::path path; std::vector<uint8_t> data; };
++  std::vector<Entry> entries;
++};
++
+ } // namespace aurora::io
+diff --git a/lib/webgpu/gpu.cpp b/lib/webgpu/gpu.cpp
+index b3ae6cd..8887cce 100644
+--- a/lib/webgpu/gpu.cpp
++++ b/lib/webgpu/gpu.cpp
+@@ -249,13 +249,13 @@ wgpu::PresentMode select_present_mode(const wgpu::SurfaceCapabilities& capabilit
+       return wgpu::PresentMode::FifoRelaxed;
+     }
+   } else {
+-    // Dawn only disables CAMetalLayer displaySyncEnabled for Immediate on Metal
+-    if (g_backendType != wgpu::BackendType::Metal && supports(wgpu::PresentMode::Mailbox)) {
+-      return wgpu::PresentMode::Mailbox;
+-    }
++    // Immediate avoids a refresh-rate wait when the user disables VSync.
+     if (supports(wgpu::PresentMode::Immediate)) {
+       return wgpu::PresentMode::Immediate;
+     }
++    if (g_backendType != wgpu::BackendType::Metal && supports(wgpu::PresentMode::Mailbox)) {
++      return wgpu::PresentMode::Mailbox;
++    }
+   }
+   return wgpu::PresentMode::Fifo;
+ }
+@@ -789,6 +789,10 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
+         .enabledToggleCount = instanceToggles.size(),
+         .enabledToggles = instanceToggles.data(),
+     }};
++#if defined(_WIN32) && !defined(_MSC_VER)
++    // shortcut: Dawn's MSVC package exposes its C ABI; instance logging/profiling needs an ABI-matched build.
++    instanceDescriptor.nextInChain = &instanceTogglesDescriptor;
++#else
+     dawn::native::DawnInstanceDescriptor dawnInstanceDescriptor{};
+     dawnInstanceDescriptor.nextInChain = &instanceTogglesDescriptor;
+     dawnInstanceDescriptor.backendValidationLevel = dawn::native::BackendValidationLevel::Disabled;
+@@ -797,6 +801,7 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
+     dawnInstanceDescriptor.platform = tracy_dawn_platform();
+ #endif
+     instanceDescriptor.nextInChain = &dawnInstanceDescriptor;
++#endif
+ #endif
+     g_instance = wgpu::CreateInstance(&instanceDescriptor);
+     if (!g_instance) {
+diff --git a/lib/window.cpp b/lib/window.cpp
+index cf84de3..fedc659 100644
+--- a/lib/window.cpp
++++ b/lib/window.cpp
+@@ -47,6 +47,7 @@ SDL_Window* g_window;
+ SDL_Renderer* g_renderer;
+ float g_frameBufferScale = 0.f;
+ bool g_frameBufferAspectFit = false;
++float g_contentAspect = 0;
+ AuroraWindowSize g_windowSize;
+ std::vector<AuroraEvent> g_events;
+ std::deque<std::string> g_eventStrings;
+@@ -487,11 +488,11 @@ AuroraWindowSize get_window_size() {
+     fb_w = scaledW;
+     fb_h = scaledH;
+   }
+-  if (g_frameBufferAspectFit) {
++  if (g_frameBufferAspectFit || g_contentAspect > 0) {
+     const auto [baseW, baseH] = vi::configured_fb_size();
+     if (baseW > 0 && baseH > 0) {
+       const auto [fitW, fitH] =
+-          fit_frame_buffer_to_aspect(fb_w, fb_h, static_cast<float>(baseW) / static_cast<float>(baseH));
++          fit_frame_buffer_to_aspect(fb_w, fb_h, g_contentAspect > 0 ? g_contentAspect : static_cast<float>(baseW) / static_cast<float>(baseH));
+       fb_w = fitW;
+       fb_h = fitH;
+     }
+@@ -612,6 +613,11 @@ void set_frame_buffer_aspect_fit(bool fit) {
+   request_frame_buffer_resize();
+ }
+ 
++void set_content_aspect(float aspect) {
++  if (!std::isfinite(aspect) || aspect < 0 || aspect > 4 || g_contentAspect == aspect) return;
++  g_contentAspect = aspect; request_frame_buffer_resize();
++}
++
+ void set_background_input(bool value) { SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, value ? "1" : "0"); }
+ 
+ } // namespace aurora::window
+@@ -622,3 +628,5 @@ extern "C" JNIEXPORT void JNICALL Java_dev_encounter_aurora_AuroraSurface_native
+   aurora::window::set_surface_ready(ready == JNI_TRUE);
+ }
+ #endif
++
++extern "C" void AuroraSetContentAspect(float aspect) { aurora::window::set_content_aspect(aspect); }
+diff --git a/lib/window.hpp b/lib/window.hpp
+index 51257ea..c125bcf 100644
+--- a/lib/window.hpp
++++ b/lib/window.hpp
+@@ -50,5 +50,6 @@ void center_window();
+ void request_frame_buffer_resize();
+ void set_frame_buffer_scale(float scale);
+ void set_frame_buffer_aspect_fit(bool fit);
++void set_content_aspect(float aspect);
+ void set_background_input(bool value);
+ }; // namespace aurora::window
+diff --git a/lib/host_memory.hpp b/lib/host_memory.hpp
+new file mode 100644
+index 0000000..bcfeed1
+--- /dev/null
++++ b/lib/host_memory.hpp
+@@ -0,0 +1,10 @@
++#pragma once
++#include <utility>
++namespace aurora {
++// Native service records must survive the game memory pools that call them.
++inline thread_local bool hostMemory = false;
++struct HostMemoryScope {
++    bool previous = std::exchange(hostMemory, true);
++    ~HostMemoryScope() { hostMemory = previous; }
++};
++}

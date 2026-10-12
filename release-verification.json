@@ -1,0 +1,15 @@
+{
+  "full_regressions_passed": true,
+  "full_regressions_seconds": 286.515,
+  "development_executable_sha256": "a8f8acae8251af0ed1edbf226cb737910c23a2a5f74dedb3771988e4b3a5e47d",
+  "portable_executable_sha256": "49e527bc506fb7b71410985743e3604b1acb47359237ed87130d943232827d90",
+  "package_sha256": "1d31e13ba26a9762452696347ee57d100656b7294a34b97ce9d7fdaa7fddc882",
+  "package": "Galaxy-PC-Builder-20261011-180720.zip",
+  "native_assets_only_boot_verified": true,
+  "rom_assets_included": false,
+  "local_save_unchanged": true,
+  "lan_lobby_available": true,
+  "co_op_gameplay_available": false,
+  "separate_pc_radmin_verified": false,
+  "clean_windows10_launch_verified": false
+}

@@ -1,0 +1,26 @@
+# Game data and private local state never belong in the source repository.
+**/game-data/
+**/userdata/
+**/mods/
+**/orig/
+**/build*/
+**/__pycache__/
+**/tools/github-cli/
+**/tools/python/
+**/tools/zig/
+*.iso
+*.wbfs
+*.rvz
+*.dol
+*.gcp
+*.mp4
+*.thp
+*.tpl
+*.arc
+*.aw
+*.wsys
+*.log
+*.pdb
+*.exe
+*.dll
+

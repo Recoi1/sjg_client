@@ -1,0 +1,10 @@
+{
+  "Petari": {
+    "url": "https://github.com/SMGCommunity/Petari.git",
+    "commit": "679dc500aaaf2eaa3fce86c3f75fcc32806bed21"
+  },
+  "Aurora": {
+    "url": "https://github.com/encounter/aurora.git",
+    "commit": "50e5be30ec12cc72768bc564bc016b55e82be868"
+  }
+}
