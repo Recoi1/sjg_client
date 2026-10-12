@@ -162,7 +162,7 @@
     "tests/os_services.cpp": "ee79cec178a065acb523b88e1c707d29bcb9335a8015b24d49e344bab72aa5a8",
     "tests/particle_resources.cpp": "866e2273e35f63ce945e745e7954dc8b8eab0d020a6adab4d2fe30e4405f2d86",
     "tests/platform_services.cpp": "4f3141ecd37aec29dee561b773979a1a873903e460e91a24e5c64a09c7289653",
-    "tests/publish_update.py": "b81d191dcd470019e59d2f4097387c6e372ebb5cd0b0775c79b4c0c6639b887f",
+    "tests/publish_update.py": "5edc38f53bb08a118df9e504caa568476d5ac77b1d55f4be6240d50ba868c256",
     "tests/resources.cpp": "1d34c42c74ced51bc2c154b56e6889323b0d06a1e3d7646627a7d0907ed00f83",
     "tests/rfl_resource.cpp": "c05975bbebfbc3f450d71cbd8177ff6a3db7a9acfd25ef9de56e3b43e68adb11",
     "tests/rfl_system.cpp": "40fa43d3122b698b0ffec56ff4bedeedf1c77aef9ea7e6f4e91a0bdb9882c9f9",
