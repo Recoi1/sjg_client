@@ -187,7 +187,7 @@
     "tools/hd-texture-inventory.cpp": "8e3cc35d44c5bdcd8ad04c626848baffaf3537bdfae4189fe5c2852d6b5b14a9",
     "tools/package-portable.py": "187884210525c3a8c0678d67e166dba3672f16dee28e931792ad1447a5769959",
     "tools/prepare-assets.py": "99b1ffda6a1cf2241de3b81391ea83eb1a70bbb1fa26be945f65c1c4980fab8a",
-    "tools/publish-update.py": "6e9325cd3abe9c49a67414d8afe42e9e8afb059bd4b1272bd165bb867f4a4af9",
+    "tools/publish-update.py": "8e229b7f77030aa0faeae658afbbc63d914af041f1b6d48d8993b96728c315e1",
     "tools/zig-ar.cmd": "b7ec1d64d78ccc6b06fa5ee43333eb5835ca000194f25ea7b3c44f6a49a5b69b",
     "tools/zig-cc.cmd": "331d44a621b2d2b4962b6ce53ed78a1031892c001e27b3e456ca5b883df3849d",
     "tools/zig-cxx.cmd": "783be42be51d77c3373f4e99d186102f97080395810da7ec8ce4ecc61ef1e2a2",
@@ -195,7 +195,7 @@
     "tools/zig-rc.cmd": "7703dfa987596380aca98646bce7b3e1e7bd301db2c7dba1719a769b9bd672ad",
     "patches/Petari-native.patch": "a9c55559fe53358bbcd300699c443e7fcb9afbbe5b4b9a78a513090c0adaf39d",
     "patches/Aurora-mingw.patch": "8717387a0b936a570463dbb26205b9553125ea55593f451e18c56af5883646be",
-    "licenses/Petari.txt": "4d2eef679d5faf924534bcc132646322e9a852ce50ae5616694e0b95f7b8275d",
-    "licenses/Aurora.txt": "037e7ddff10abcc8471581dade6906de6b28ae6fcb8126bb2e65e34c67c61c06"
+    "licenses/Petari.txt": "36ffd9dc085d529a7e60e1276d73ae5a030b020313e6c5408593a6ae2af39673",
+    "licenses/Aurora.txt": "40c03cee04cda570d1029b85b6c2ee7ba78431ab1a754b9d912091d73b8ecb18"
   }
 }

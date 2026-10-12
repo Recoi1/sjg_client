@@ -63,7 +63,8 @@ def export_sources(destination):
         exported['patches/'+name]=sha256(target)
     for name in ('Petari','Aurora'):
         source=ROOT/('aurora' if name=='Aurora' else name)/'LICENSE'
-        target=public/'licenses'/(name+'.txt');target.parent.mkdir(exist_ok=True);shutil.copyfile(source,target)
+        target=public/'licenses'/(name+'.txt');target.parent.mkdir(exist_ok=True)
+        target.write_text(source.read_text(encoding='utf-8-sig'),encoding='utf-8',newline='\n')
         exported['licenses/'+target.name]=sha256(target)
     # Remove only files recorded by an earlier export, never arbitrary repository content.
     previous=public/'source-export.json'
